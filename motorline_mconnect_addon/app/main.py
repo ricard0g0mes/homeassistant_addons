@@ -41,41 +41,63 @@ def load_options():
 def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int]:
     """
     Faz login na API Motorline. Retorna (access_token, expires_in_seconds) ou (None, 0).
-    Tenta endpoints comuns: /auth/login, /login.
+    Tenta endpoints comuns: /auth/login, /login, /api/v1/auth/login, etc.
     """
-    for endpoint in ("/auth/login", "/login", "/api/auth/login", "/api/login"):
+    endpoints = (
+        "/auth/login",
+        "/login",
+        "/api/auth/login",
+        "/api/login",
+        "/api/v1/auth/login",
+        "/api/v1/login",
+        "/v1/auth/login",
+        "/v1/login",
+    )
+    
+    # Tentativa JSON
+    for endpoint in endpoints:
         url = f"{api_base_url.rstrip('/')}{endpoint}"
         try:
+            logger.info("Tentativa login JSON: %s", url)
             r = requests.post(
                 url,
                 json={"email": email, "password": password},
                 headers={"Content-Type": "application/json"},
                 timeout=15,
             )
+            logger.info("Resposta: status=%s, headers=%s", r.status_code, dict(r.headers))
             if r.status_code != 200:
+                logger.warning("Status %s em %s: %s", r.status_code, endpoint, r.text[:200])
                 continue
             data = r.json()
+            logger.info("Resposta JSON: %s", {k: v for k, v in data.items() if k != "token" and k != "access_token" and k != "accessToken"})
             token = data.get("access_token") or data.get("token") or data.get("accessToken")
             if not token:
+                logger.warning("Token não encontrado na resposta de %s", endpoint)
                 continue
             # Algumas APIs devolvem expires_in em segundos
             expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
             logger.info("Login OK via %s, token expira em %s s", endpoint, expires_in)
             return token, expires_in
+        except requests.exceptions.RequestException as e:
+            logger.warning("Erro de rede em %s: %s", endpoint, e)
+            continue
         except Exception as e:
-            logger.debug("Tentativa %s falhou: %s", endpoint, e)
+            logger.warning("Erro inesperado em %s: %s", endpoint, e)
             continue
 
     # Tentativa form-urlencoded
-    for endpoint in ("/auth/login", "/login"):
+    for endpoint in ("/auth/login", "/login", "/api/auth/login", "/api/login"):
         url = f"{api_base_url.rstrip('/')}{endpoint}"
         try:
+            logger.info("Tentativa login form-urlencoded: %s", url)
             r = requests.post(
                 url,
                 data={"email": email, "password": password},
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=15,
             )
+            logger.info("Resposta form: status=%s", r.status_code)
             if r.status_code != 200:
                 continue
             data = r.json()
@@ -83,10 +105,11 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
             if not token:
                 continue
             expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
-            logger.info("Login OK (form) via %s", endpoint)
+            logger.info("Login OK (form) via %s, token expira em %s s", endpoint, expires_in)
             return token, expires_in
         except Exception as e:
             logger.debug("Tentativa form %s falhou: %s", endpoint, e)
+            continue
 
     logger.error("Login falhou em todos os endpoints tentados")
     return None, 0
@@ -221,6 +244,30 @@ def device_value():
     if ok:
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": err}), 502
+
+
+@app.route("/test-login", methods=["GET", "POST"])
+def test_login():
+    """Endpoint de teste para verificar o login manualmente."""
+    opts = load_options()
+    api_base_url = opts.get("api_base_url", "https://api.mconnect.motorline.pt")
+    email = opts.get("email", "")
+    password = opts.get("password", "")
+    
+    if not email or not password:
+        return jsonify({"ok": False, "error": "email ou password não configurados"}), 400
+    
+    logger.info("Teste de login iniciado...")
+    token, expires_in = login(api_base_url, email, password)
+    
+    if token:
+        return jsonify({
+            "ok": True,
+            "token": token[:20] + "..." if len(token) > 20 else token,
+            "expires_in": expires_in,
+            "message": "Login bem-sucedido"
+        })
+    return jsonify({"ok": False, "error": "Login falhou - verifica os logs"}), 401
 
 
 if __name__ == "__main__":
