@@ -158,6 +158,22 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     return False, "401 após renovação de token"
 
 
+@app.route("/")
+def index():
+    """Página inicial com informações sobre o addon."""
+    return jsonify({
+        "name": "Motorline MConnect Proxy",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "/health": "GET - Verifica se o serviço está a funcionar",
+            "/trigger": "GET/POST - Dispara o comando do portão (query: ?value=1)",
+            "/command": "GET/POST - Alias para /trigger",
+            "/device/value": "PUT/POST - Define valor do dispositivo (body: {\"value\": 1})"
+        }
+    })
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
