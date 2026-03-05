@@ -26,6 +26,7 @@ options:
   device_id:
     description: ID do dispositivo (portão) - ex. 66755146c8a511e8645bd710
     example: "66755146c8a511e8645bd710"
+    required: true
   refresh_before_expiry_seconds:
     default: 300
     description: Renovar token N segundos antes de expirar (0 = só ao receber 401)
