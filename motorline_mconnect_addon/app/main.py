@@ -213,6 +213,22 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     return False, "401 após renovação de token"
 
 
+@app.route("/")
+def index():
+    """Página inicial com endpoints disponíveis."""
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Motorline MConnect</title></head><body>"
+        "<h1>Motorline MConnect Add-on</h1>"
+        "<ul>"
+        "<li><a href='/health'>/health</a> – Estado do serviço</li>"
+        "<li><a href='/login/status'>/login/status</a> – Estado do login (awaiting_code / ready)</li>"
+        "<li>POST /login/verify – Submeter código do email (body: {\"code\": \"123456\"})</li>"
+        "<li>GET/POST <a href='/trigger'>/trigger</a> – Disparar portão</li>"
+        "</ul>"
+        "</body></html>"
+    ), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
