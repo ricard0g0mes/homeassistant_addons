@@ -46,6 +46,19 @@ No HA, em **Definições** → **Add-ons** → **Motorline MConnect** → **Conf
 
 Reinicia o addon após guardar.
 
+## Login com código por email
+
+Se a API Motorline enviar um **código de verificação por email** em vez de devolver o token logo:
+
+1. Ao iniciar (ou ao renovar token), o addon faz login com email/password. Se a API responder "código enviado", o addon fica em **à espera do código**.
+2. Abre o email, copia o código.
+3. Submete o código de uma das formas:
+   - **REST** (no HA): `POST http://<addon>:8765/login/verify` com body `{"code": "123456"}`.
+   - **cURL**: `curl -X POST http://<IP>:8765/login/verify -H "Content-Type: application/json" -d '{"code":"123456"}'`
+4. Depois disso o addon guarda o token e o portão volta a funcionar.
+
+Para ver o estado: **GET** `http://<host>:8765/login/status` → `"status": "awaiting_code"` | `"ready"` | `"not_logged_in"`.
+
 ## Endpoints do addon (porta 8765)
 
 - **GET/POST** `http://<host>:8765/trigger` ou `/command`  
@@ -57,6 +70,12 @@ Reinicia o addon após guardar.
 
 - **GET** `http://<host>:8765/health`  
   Verificação de estado (responde `{"status":"ok"}`).
+
+- **GET** `http://<host>:8765/login/status`  
+  Indica se está à espera do código (`awaiting_code`), ativo (`ready`) ou não autenticado.
+
+- **POST** `http://<host>:8765/login/verify`  
+  Body: `{"code": "123456"}` — submete o código recebido por email para concluir o login.
 
 Dentro do HA, o host do addon é normalmente o nome do addon (ex.: `a0d7b954_motorline_mconnect`) ou `localhost` se acederes a partir do próprio HA.
 
@@ -75,7 +94,33 @@ rest_command:
 
 (Substitui `a0d7b954_motorline_mconnect` pelo nome real do contentor do addon; podes ver em **Definições** → **Add-ons** → **Motorline MConnect** → **Info** → **Host** / URL do addon.)
 
-### 2) Botão ou script
+### 2) Submeter código de verificação (quando o login pede código por email)
+
+Adiciona um `input_text` para o código e um REST command que envia o código ao addon:
+
+```yaml
+# configuration.yaml
+input_text:
+  motorline_codigo_email:
+    name: Código Motorline (email)
+    max: 10
+
+rest_command:
+  motorline_portao:
+    url: "http://a0d7b954_motorline_mconnect:8765/trigger"
+    method: POST
+    content_type: "application/json"
+    payload: '{"value": 1}'
+  motorline_submeter_codigo:
+    url: "http://a0d7b954_motorline_mconnect:8765/login/verify"
+    method: POST
+    content_type: "application/json"
+    payload_template: '{"code": "{{ states(''input_text.motorline_codigo_email'') }}"}'
+```
+
+Fluxo: quando o addon pedir o código, abres o email, colas o código em **Entidades** → `input_text.motorline_codigo_email`, e chamas o serviço `rest_command.motorline_submeter_codigo` (por exemplo com um botão no dashboard).
+
+### 3) Botão ou script (portão)
 
 ```yaml
 # script
@@ -87,7 +132,7 @@ script:
 
 Ou num dashboard: **Entidades** → **Criar botão** → Ação: **Chamar serviço** → `rest_command.motorline_portao`.
 
-### 3) Chamar por URL (navegador ou HTTP)
+### 4) Chamar por URL (navegador ou HTTP)
 
 ```
 POST http://<IP_HA>:8765/trigger

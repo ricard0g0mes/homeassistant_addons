@@ -32,69 +32,122 @@ app = Flask(__name__)
 _token = None
 _token_expires_at = 0.0
 
+# Login em 2 fases: quando a API envia código por email
+_awaiting_code = False
+_login_session = None  # {"api_base_url", "email", "session_id" ou "request_id" (se a API devolver)}
+
 
 def load_options():
     with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
+# UUID fixo para o addon (API MConnect exige em /user/mfa/verify)
+MFA_DEVICE_UUID = "motorline-mconnect-addon-1"
+
+
+def _is_mfa_required_response(status_code: int, data: dict) -> bool:
+    """Deteta se a API pediu MFA (código por email) em vez de token."""
+    if status_code == 401:
+        return True
+    if status_code not in (200, 202, 204) or not isinstance(data, dict):
+        return False
+    if data.get("access_token") or data.get("token") or data.get("accessToken"):
+        return False
+    if data.get("mfa_required") or data.get("mfa") is True:
+        return True
+    msg = (data.get("message") or data.get("msg") or "").lower()
+    if any(x in msg for x in ("mfa", "code", "codigo", "código", "verification", "email")):
+        return True
+    return False
+
+
 def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int]:
     """
-    Faz login na API Motorline. Retorna (access_token, expires_in_seconds) ou (None, 0).
-    Tenta endpoints comuns: /auth/login, /login.
+    Faz login na API Motorline (api.mconnect.motorline.pt).
+    Endpoint: POST /auth/token com grant_type=authorization, email, password, mfa=true.
+    Se a API exigir MFA, define awaiting_code e retorna (None, 0); o utilizador submete o código em /login/verify.
     """
-    for endpoint in ("/auth/login", "/login", "/api/auth/login", "/api/login"):
-        url = f"{api_base_url.rstrip('/')}{endpoint}"
-        try:
-            r = requests.post(
-                url,
-                json={"email": email, "password": password},
-                headers={"Content-Type": "application/json"},
-                timeout=15,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            token = data.get("access_token") or data.get("token") or data.get("accessToken")
-            if not token:
-                continue
-            # Algumas APIs devolvem expires_in em segundos
-            expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
-            logger.info("Login OK via %s, token expira em %s s", endpoint, expires_in)
-            return token, expires_in
-        except Exception as e:
-            logger.debug("Tentativa %s falhou: %s", endpoint, e)
-            continue
+    global _awaiting_code, _login_session
 
-    # Tentativa form-urlencoded
-    for endpoint in ("/auth/login", "/login"):
-        url = f"{api_base_url.rstrip('/')}{endpoint}"
-        try:
-            r = requests.post(
-                url,
-                data={"email": email, "password": password},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            token = data.get("access_token") or data.get("token") or data.get("accessToken")
-            if not token:
-                continue
-            expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
-            logger.info("Login OK (form) via %s", endpoint)
-            return token, expires_in
-        except Exception as e:
-            logger.debug("Tentativa form %s falhou: %s", endpoint, e)
+    base = api_base_url.rstrip("/")
+    url = f"{base}/auth/token"
+    body = {
+        "grant_type": "authorization",
+        "email": email,
+        "password": password,
+        "mfa": True,
+    }
+    headers = {"Content-Type": "application/json"}
 
-    logger.error("Login falhou em todos os endpoints tentados")
+    try:
+        r = requests.post(url, json=body, headers=headers, timeout=15)
+        data = r.json() if r.text else {}
+        token = data.get("access_token") or data.get("token") or data.get("accessToken")
+        if r.status_code == 200 and token:
+            expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
+            logger.info("Login OK (token direto), expira em %s s", expires_in)
+            return token, expires_in
+        if r.status_code == 401 or _is_mfa_required_response(r.status_code, data):
+            _awaiting_code = True
+            _login_session = {"api_base_url": base, "email": email}
+            logger.info("MFA exigido. Código enviado por email. Use POST /login/verify com o código.")
+            return None, 0
+        logger.warning("Login inesperado: status=%s body=%s", r.status_code, data)
+    except Exception as e:
+        logger.debug("Login /auth/token falhou: %s", e)
+
+    logger.error("Login falhou")
+    return None, 0
+
+
+def verify_code(code: str) -> tuple[str | None, int]:
+    """
+    Completa o login MFA com o código recebido por email.
+    API Motorline: POST /user/mfa/verify com code, platform, model, uuid.
+    Retorna (access_token, expires_in) ou (None, 0).
+    """
+    global _awaiting_code, _login_session
+
+    if not _awaiting_code or not _login_session:
+        logger.error("Nenhum login à espera de código. Faça primeiro login (email/password).")
+        return None, 0
+
+    base = _login_session["api_base_url"]
+    url = f"{base}/user/mfa/verify"
+    payload = {
+        "code": code.strip(),
+        "platform": "HomeAssistant",
+        "model": "addon",
+        "uuid": MFA_DEVICE_UUID,
+    }
+    try:
+        r = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        data = r.json() if r.text else {}
+        token = data.get("access_token") or data.get("token") or data.get("accessToken")
+        if r.status_code == 200 and token:
+            expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
+            _awaiting_code = False
+            _login_session = None
+            logger.info("MFA verificado, token obtido (expira em %s s)", expires_in)
+            return token, expires_in
+        logger.warning("MFA verify falhou: status=%s body=%s", r.status_code, data)
+    except Exception as e:
+        logger.debug("MFA verify falhou: %s", e)
+
     return None, 0
 
 
 def ensure_token() -> str | None:
-    """Obtém um token válido (renovando se necessário)."""
+    """Obtém um token válido (renovando se necessário). Se estiver à espera de código, retorna None."""
     global _token, _token_expires_at
+    if _awaiting_code:
+        return None
     opts = load_options()
     refresh_before = int(opts.get("refresh_before_expiry_seconds", 300))
     now = time.time()
@@ -131,6 +184,8 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     for attempt in range(2):
         token = ensure_token()
         if not token:
+            if _awaiting_code:
+                return False, "À espera do código por email. Submeta em POST /login/verify com {\"code\": \"...\"}"
             return False, "Falha ao obter token"
 
         headers = {
@@ -161,6 +216,41 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/login/status", methods=["GET"])
+def login_status():
+    """Indica se o add-on está à espera do código de verificação por email."""
+    global _awaiting_code, _token
+    if _awaiting_code:
+        return jsonify({"status": "awaiting_code", "message": "Abra o email e submeta o código em POST /login/verify"})
+    if _token:
+        return jsonify({"status": "ready", "message": "Sessão ativa"})
+    return jsonify({"status": "not_logged_in", "message": "Faça login (ou aguarde renovação)"})
+
+
+@app.route("/login/verify", methods=["POST"])
+def login_verify():
+    """
+    Submete o código recebido por email para completar o login.
+    Body JSON: {"code": "123456"} ou query ?code=123456
+    """
+    global _token, _token_expires_at
+    code = None
+    if request.is_json and request.json:
+        code = (request.json.get("code") or request.json.get("otp") or "").strip()
+    if not code:
+        code = (request.args.get("code") or request.args.get("otp") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "Envie o código no body: {\"code\": \"123456\"}"}), 400
+
+    token, expires_in = verify_code(code)
+    if not token:
+        return jsonify({"ok": False, "error": "Código inválido ou API não respondeu com token"}), 400
+
+    _token = token
+    _token_expires_at = time.time() + expires_in
+    return jsonify({"ok": True, "message": "Login concluído. Pode usar /trigger para o portão."})
 
 
 @app.route("/trigger", methods=["GET", "POST"])
