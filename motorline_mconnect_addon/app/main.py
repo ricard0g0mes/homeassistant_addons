@@ -193,8 +193,8 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
             "Content-Type": "application/json",
         }
         try:
-            # Assumir PUT ou PATCH com body {"value": ...}; se a API for diferente, ajustar
-            r = requests.put(
+            # API MConnect exige POST (PUT devolve 405 Method Not Allowed)
+            r = requests.post(
                 url,
                 json={"value": value},
                 headers=headers,
