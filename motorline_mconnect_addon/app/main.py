@@ -69,6 +69,8 @@ def load_options():
         "device_id": (state.get("device_id") or "").strip(),
         "token": (state.get("token") or "").strip() or None,
         "token_expires_at": state.get("token_expires_at") or 0,
+        "user_token": (state.get("user_token") or "").strip() or None,
+        "user_token_expires_at": state.get("user_token_expires_at") or 0,
     }
 
 
@@ -282,6 +284,33 @@ def exchange_user_token_for_home_token(user_token: str) -> tuple[str | None, int
         return None, 0, None
 
 
+def exchange_for_device_token(user_token: str, home_token: str | None, home_id: str | None, device_id: str) -> tuple[str | None, int]:
+    """
+    Tenta obter um token com device_id no payload (api.mconnect.motorline.pt exige isso).
+    Prova rest.mconnect.pt: POST /devices/auth/token ou /homes/devices/auth/token.
+    """
+    base = API_BASE_URL.rstrip("/")
+    for code, label in [(user_token, "user"), (home_token or user_token, "home")]:
+        if not code:
+            continue
+        for path, body in [
+            (f"{base}/devices/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id}),
+            (f"{base}/devices/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id, "home_id": home_id or ""}),
+            (f"{base}/homes/devices/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id, "home_id": home_id or ""}),
+        ]:
+            try:
+                r = requests.post(path, json=body, headers={"Content-Type": "application/json"}, timeout=10)
+                data = r.json() if r.text else {}
+                tok = data.get("access_token") or data.get("token") or data.get("accessToken")
+                if r.status_code == 200 and tok:
+                    exp = int(data.get("expires_in", data.get("expiresIn", 3600)))
+                    logger.info("Token por dispositivo obtido em %s (exp %s s)", path, exp)
+                    return tok, exp
+            except Exception as e:
+                logger.debug("exchange_for_device_token %s: %s", path, e)
+    return None, 0
+
+
 def get_devices(token: str) -> list[dict]:
     """Lista dispositivos. Na rest.mconnect.pt vêm em GET /rooms (cada room tem devices)."""
     base = API_BASE_URL.rstrip("/")
@@ -339,12 +368,16 @@ def _release_login_file_lock(fd):
 
 def ensure_token() -> tuple[str | None, str]:
     """Retorna o token se válido (memória ou state). Nunca chama login() — o código só é pedido quando o utilizador clica em 'Pedir código por email'."""
-    global _token, _token_expires_at
+    global _token, _token_expires_at, _user_token, _user_token_expires_at
     if _awaiting_code:
         return None, "À espera do código por email"
     opts = load_options()
     refresh_before = int(opts.get("refresh_before_expiry_seconds", REFRESH_BEFORE_EXPIRY_SECONDS))
     now = time.time()
+    # Hidratar user_token do state se em memória estiver vazio
+    if not _user_token and opts.get("user_token") and (opts.get("user_token_expires_at") or 0) > now:
+        _user_token = opts["user_token"]
+        _user_token_expires_at = float(opts["user_token_expires_at"])
     if _token and _token_expires_at > now + refresh_before:
         return _token, ""
     # Hidratar a partir do state (ex.: após reinício do addon)
@@ -388,18 +421,24 @@ def _post_device_value(device_id: str, num: int, token: str, auth_scheme: str = 
 
 def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, str]:
     """
-    Define o valor do dispositivo (portão). Endpoint em api.mconnect.motorline.pt.
-    Tenta primeiro com token da casa (Jwt); em 401 tenta com token de utilizador (Jwt).
+    Define o valor do dispositivo (portão). api.mconnect.motorline.pt.
+    Tenta por ordem: user_token (Jwt), token guardado (Jwt), Bearer.
     """
-    global _token, _token_expires_at
-    base = DEVICES_API_BASE_URL.rstrip("/")
     num = 2 if value in (1, "1", "open") else int(value) if isinstance(value, (int, float)) else 2
+
+    # 1) Token de utilizador primeiro (o JWT que funciona no rest_command costuma ser este)
+    if _user_token and _user_token_expires_at > time.time():
+        ok, status, err = _post_device_value(device_id, num, _user_token, "Jwt")
+        if ok:
+            return True, ""
+        if status != 401:
+            logger.warning("devices/value (user_token): HTTP %s %s", status, err)
 
     token, error_msg = ensure_token()
     if not token:
         return False, error_msg or "Falha ao obter token"
 
-    # 1) Tentar com token principal (casa) — Jwt
+    # 2) Token principal (casa ou dispositivo) — Jwt
     ok, status, err = _post_device_value(device_id, num, token, "Jwt")
     if ok:
         return True, ""
@@ -411,13 +450,6 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     ok, status, _ = _post_device_value(device_id, num, token, "Bearer")
     if ok:
         return True, ""
-
-    # 2) Fallback: token de utilizador
-    if _user_token and _user_token_expires_at > time.time():
-        ok, status2, err2 = _post_device_value(device_id, num, _user_token, "Jwt")
-        if ok:
-            return True, ""
-        logger.warning("devices/value 401 também com user_token. Resposta: %s", err2)
 
     # Não limpar _token: o painel continua "Operacional"; o utilizador vê o erro e pode clicar em "Pedir código por email" quando quiser.
     return False, "401 na API do portão — token expirado ou inválido. Clique em 'Pedir código por email' no painel para obter um novo."
@@ -703,7 +735,16 @@ def login_verify():
         }), 400
 
     home_token, home_expires, home_id = exchange_user_token_for_home_token(user_token)
-    if home_token:
+    _user_token = user_token
+    _user_token_expires_at = time.time() + (home_expires if home_token else expires_in)
+    _token_expired_alert = False
+
+    device_id = (load_options().get("device_id") or "").strip()
+    device_token, device_exp = exchange_for_device_token(user_token, home_token, home_id or "", device_id) if device_id else (None, 0)
+    if device_token:
+        _token = device_token
+        _token_expires_at = time.time() + device_exp
+    elif home_token:
         _token = home_token
         _token_expires_at = time.time() + home_expires
         if home_id:
@@ -711,10 +752,12 @@ def login_verify():
     else:
         _token = user_token
         _token_expires_at = time.time() + expires_in
-    _user_token = user_token
-    _user_token_expires_at = time.time() + (home_expires if home_token else expires_in)
-    _token_expired_alert = False
-    save_state({"token": _token, "token_expires_at": _token_expires_at})
+    save_state({
+        "token": _token,
+        "token_expires_at": _token_expires_at,
+        "user_token": _user_token,
+        "user_token_expires_at": _user_token_expires_at,
+    })
 
     opts = load_options()
     device_id = (opts.get("device_id") or "").strip()
@@ -777,12 +820,16 @@ def device_value():
 
 
 if __name__ == "__main__":
-    # Carregar token persistido para sobreviver a reinícios
+    # Carregar tokens persistidos para sobreviver a reinícios
     opts = load_options()
-    if opts.get("token") and (opts.get("token_expires_at") or 0) > time.time():
+    now = time.time()
+    if opts.get("token") and (opts.get("token_expires_at") or 0) > now:
         _token = opts["token"]
         _token_expires_at = float(opts["token_expires_at"])
         logger.info("Token restaurado do state")
+    if opts.get("user_token") and (opts.get("user_token_expires_at") or 0) > now:
+        _user_token = opts["user_token"]
+        _user_token_expires_at = float(opts["user_token_expires_at"])
     port = int(os.environ.get("PORT", 8765))
     logger.info("A iniciar servidor na porta %s", port)
     t = threading.Thread(target=_background_tasks, daemon=True)
