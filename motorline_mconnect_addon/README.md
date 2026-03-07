@@ -1,12 +1,13 @@
 # Motorline MConnect – Addon Home Assistant
 
-Addon que faz de **proxy** para a API Motorline MConnect: trata do **login** e da **renovação automática do token** (evita 401 "The token has expired") e expõe um endpoint local para comandar o portão.
+Addon que faz de **proxy** para a API Motorline MConnect: **login automático ao arranque**, **painel web** para introduzir o código enviado por email, obtenção automática do dispositivo (quando possível) e **verificação horária do token** com aviso para novo código quando a sessão expira.
 
 ## O que faz
 
-- **Login** na API (`api_base_url` + `/auth/login` ou `/login`) com email/password.
+- **Ao instalar**: Configuras email e password nas opções do addon; ao iniciar, o addon tenta login de forma transparente. Se a API enviar código por email, abre o **painel web** (http://&lt;addon&gt;:8765/) e introduces o código na janela. O **device_id** é obtido automaticamente quando há um único dispositivo.
 - **Renovação de token**: em 401 ou N segundos antes do fim da validade (`refresh_before_expiry_seconds`).
-- **Endpoint local** no addon: `http://<addon>:8765/trigger` — ao chamar, o addon usa o token (renovando se for preciso) e chama a API Motorline para definir o valor do dispositivo (portão).
+- **Verificação a cada hora**: o addon confirma se o token ainda é válido; se não for, alerta no painel e pede novo código por email (introdução na mesma janela).
+- **Endpoint local**: `http://<addon>:8765/trigger` — comando do portão.
 
 ## Instalação no Home Assistant
 
@@ -41,23 +42,20 @@ No HA, em **Definições** → **Add-ons** → **Motorline MConnect** → **Conf
 | `api_base_url` | URL base da API (default: `https://api.mconnect.motorline.pt`) |
 | `email` | Email da conta MConnect |
 | `password` | Password da conta |
-| `device_id` | ID do dispositivo/portão (ex.: `66755146c8a511e8645bd710`) |
+| `device_id` | (Opcional) ID do dispositivo/portão. Se vazio, é obtido automaticamente após o primeiro login (quando há um único dispositivo). |
 | `refresh_before_expiry_seconds` | Renovar token N segundos antes de expirar (default: 300). 0 = só renovar ao receber 401 |
 
 Reinicia o addon após guardar.
 
-## Login com código por email
+## Painel web e código por email
 
-Se a API Motorline enviar um **código de verificação por email** em vez de devolver o token logo:
+1. **Após instalar**: Em **Definições** → **Add-ons** → **Motorline MConnect** define **email** e **password**, guarda e inicia o addon.
+2. Abre o **painel do addon**: `http://<addon>:8765/` (no HA: **Add-ons** → **Motorline MConnect** → **Abrir painel web** ou usa o URL do addon na porta 8765).
+3. O addon inicia o login automaticamente. Se a API enviar um **código por email**, o painel mostra a mensagem e um campo para introduzir o código. Introduz o código e clica em **Submeter código**.
+4. Se não tiveres `device_id` configurado, o addon obtém-o automaticamente (um dispositivo) ou guarda o primeiro da lista.
+5. **Quando a sessão expirar** (verificação a cada hora): o painel mostra um aviso a amarelo e volta a pedir o código. Recebes novo email da Motorline; introduz o código no mesmo painel.
 
-1. Ao iniciar (ou ao renovar token), o addon faz login com email/password. Se a API responder "código enviado", o addon fica em **à espera do código**.
-2. Abre o email, copia o código.
-3. Submete o código de uma das formas:
-   - **REST** (no HA): `POST http://<addon>:8765/login/verify` com body `{"code": "123456"}`.
-   - **cURL**: `curl -X POST http://<IP>:8765/login/verify -H "Content-Type: application/json" -d '{"code":"123456"}'`
-4. Depois disso o addon guarda o token e o portão volta a funcionar.
-
-Para ver o estado: **GET** `http://<host>:8765/login/status` → `"status": "awaiting_code"` | `"ready"` | `"not_logged_in"`.
+Alternativa por API: **POST** `http://<addon>:8765/login/verify` com body `{"code": "123456"}`. Estado: **GET** `http://<host>:8765/login/status` → `"awaiting_code"` | `"ready"` | `"not_logged_in"`.
 
 ## Endpoints do addon (porta 8765)
 
@@ -71,11 +69,26 @@ Para ver o estado: **GET** `http://<host>:8765/login/status` → `"status": "awa
 - **GET** `http://<host>:8765/health`  
   Verificação de estado (responde `{"status":"ok"}`).
 
+- **GET** `http://<host>:8765/`  
+  **Painel web**: estado do login, introdução do código e aviso quando a sessão expira.
+
 - **GET** `http://<host>:8765/login/status`  
   Indica se está à espera do código (`awaiting_code`), ativo (`ready`) ou não autenticado.
 
+- **POST** `http://<host>:8765/login/start`  
+  Dispara o fluxo de login (usa email/password das opções). O painel chama isto ao carregar se não estiver autenticado.
+
 - **POST** `http://<host>:8765/login/verify`  
   Body: `{"code": "123456"}` — submete o código recebido por email para concluir o login.
+
+- **GET** `http://<host>:8765/api/ui-state`  
+  Estado para o painel: `status`, `token_expired_alert`, `device_id`.
+
+- **GET** `http://<host>:8765/api/devices`  
+  Lista dispositivos (requer token).
+
+- **POST** `http://<host>:8765/api/device_id`  
+  Body: `{"device_id": "..."}` — guarda o ID do dispositivo (persistente em `/data/`).
 
 Dentro do HA, o host do addon é normalmente o nome do addon (ex.: `a0d7b954_motorline_mconnect`) ou `localhost` se acederes a partir do próprio HA.
 

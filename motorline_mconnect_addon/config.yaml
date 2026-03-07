@@ -1,6 +1,6 @@
 name: Motorline MConnect
 description: Proxy para API Motorline MConnect com renovação automática de token e suporte a código por email no login (comando do portão).
-version: "1.1.0"
+version: "1.2.0"
 slug: motorline_mconnect
 arch:
   - aarch64
@@ -24,9 +24,9 @@ options:
     description: Password da conta MConnect
     example: ""
   device_id:
-    description: ID do dispositivo (portão) - ex. 66755146c8a511e8645bd710
+    description: ID do dispositivo (portão) - opcional; pode ser obtido automaticamente após login
     example: "66755146c8a511e8645bd710"
-    required: true
+    required: false
   refresh_before_expiry_seconds:
     default: 300
     description: Renovar token N segundos antes de expirar (0 = só ao receber 401)

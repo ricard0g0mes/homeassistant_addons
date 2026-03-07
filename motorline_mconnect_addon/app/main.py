@@ -3,11 +3,12 @@ from __future__ import annotations
 
 """
 Addon Home Assistant: proxy para API Motorline MConnect.
-Renova o token automaticamente em 401 e expõe endpoint local para comando do portão.
+Login automático ao arranque, painel para código por email, renovação e verificação horária do token.
 """
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -26,6 +27,13 @@ OPTIONS_PATH = Path("/data/options.json")
 if not OPTIONS_PATH.exists():
     OPTIONS_PATH = Path(__file__).parent / "options.json"
 
+# Estado persistente (device_id; addon não pode escrever options.json)
+DATA_DIR = Path("/data")
+STATE_PATH = DATA_DIR / "motorline_state.json"
+if not DATA_DIR.exists():
+    DATA_DIR = Path(__file__).parent
+    STATE_PATH = DATA_DIR / "motorline_state.json"
+
 app = Flask(__name__)
 
 # Estado do token (em memória; renovado ao receber 401 ou antes do expiry)
@@ -34,12 +42,41 @@ _token_expires_at = 0.0
 
 # Login em 2 fases: quando a API envia código por email
 _awaiting_code = False
-_login_session = None  # {"api_base_url", "email", "session_id" ou "request_id" (se a API devolver)}
+_login_session = None  # {"api_base_url", "email"}
+
+# Alerta para o painel: sessão expirou e é preciso novo código (verificação horária)
+_token_expired_alert = False
+_lock = threading.Lock()
 
 
 def load_options():
     with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        opts = json.load(f)
+    state = load_state()
+    if state.get("device_id"):
+        opts = {**opts, "device_id": state["device_id"]}
+    return opts
+
+
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("load_state falhou: %s", e)
+        return {}
+
+
+def save_state(updates: dict):
+    state = load_state()
+    state.update(updates)
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logger.warning("save_state falhou: %s", e)
 
 
 # UUID fixo para o addon (API MConnect exige em /user/mfa/verify)
@@ -143,6 +180,31 @@ def verify_code(code: str) -> tuple[str | None, int]:
     return None, 0
 
 
+def get_devices(token: str) -> list[dict]:
+    """Lista dispositivos da API (portões). Tenta GET /devices e GET /user/devices."""
+    opts = load_options()
+    base = opts.get("api_base_url", "https://api.mconnect.motorline.pt").rstrip("/")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    for path in ("/devices", "/user/devices"):
+        try:
+            r = requests.get(f"{base}{path}", headers=headers, timeout=15)
+            if r.status_code != 200:
+                continue
+            data = r.json() if r.text else {}
+            items = data if isinstance(data, list) else data.get("devices", data.get("data", []))
+            if isinstance(items, list) and items:
+                out = []
+                for d in items:
+                    if isinstance(d, dict):
+                        out.append({"id": d.get("id", d.get("device_id", d.get("_id", ""))), "name": d.get("name", d.get("label", ""))})
+                    else:
+                        out.append({"id": str(d), "name": ""})
+                return out
+        except Exception as e:
+            logger.debug("get_devices %s: %s", path, e)
+    return []
+
+
 def ensure_token() -> str | None:
     """Obtém um token válido (renovando se necessário). Se estiver à espera de código, retorna None."""
     global _token, _token_expires_at
@@ -169,6 +231,22 @@ def ensure_token() -> str | None:
     _token = token
     _token_expires_at = now + expires_in
     return _token
+
+
+def _background_tasks():
+    """Ao arranque: tenta login. A cada hora: verifica token e, se expirado, alerta para novo código."""
+    global _token_expired_alert
+    time.sleep(2)
+    with _lock:
+        ensure_token()
+    logger.info("Verificação de token em background ativa (intervalo: 1 h)")
+    while True:
+        time.sleep(3600)
+        with _lock:
+            t = ensure_token()
+            if t is None and _awaiting_code:
+                _token_expired_alert = True
+                logger.warning("Token expirado ou inválido. É necessário novo código por email.")
 
 
 def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, str]:
@@ -213,20 +291,133 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     return False, "401 após renovação de token"
 
 
+@app.route("/api/ui-state", methods=["GET"])
+def api_ui_state():
+    """Estado para o painel: status, awaiting_code, token_expired_alert, device_id."""
+    opts = load_options()
+    device_id = (opts.get("device_id") or "").strip()
+    status_res = login_status().get_json()
+    return jsonify({
+        "status": status_res["status"],
+        "message": status_res["message"],
+        "token_expired_alert": status_res.get("token_expired_alert", False),
+        "device_id": device_id or None,
+    })
+
+
+@app.route("/api/devices", methods=["GET"])
+def api_devices():
+    """Lista dispositivos (requer token)."""
+    token = ensure_token()
+    if not token:
+        return jsonify({"ok": False, "error": "Não autenticado"}), 401
+    devices = get_devices(token)
+    return jsonify({"ok": True, "devices": devices})
+
+
+@app.route("/api/device_id", methods=["POST"])
+def api_set_device_id():
+    """Guarda o device_id no estado persistente. Body: {\"device_id\": \"...\"}."""
+    data = request.get_json(silent=True) or {}
+    did = (data.get("device_id") or "").strip()
+    if not did:
+        return jsonify({"ok": False, "error": "device_id em falta"}), 400
+    save_state({"device_id": did})
+    return jsonify({"ok": True, "device_id": did})
+
+
+def _panel_html() -> str:
+    html = """<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Motorline MConnect</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; margin-bottom: 1rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
+    .alert { background: #fff3cd; border-color: #ffc107; }
+    .success { background: #d4edda; border-color: #28a745; }
+    .error { color: #721c24; font-size: 0.9rem; margin-top: 0.5rem; }
+    input, button { padding: 0.5rem 0.75rem; font-size: 1rem; }
+    input { width: 100%; margin-bottom: 0.75rem; }
+    button { background: #0d6efd; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #msg { margin-top: 0.5rem; min-height: 1.2rem; }
+  </style>
+</head>
+<body>
+  <h1>Motorline MConnect</h1>
+  <div id="panel" class="card">A carregar...</div>
+  <div id="msg"></div>
+  <script>
+    function el(id) { return document.getElementById(id); }
+    function showMsg(text, isError) {
+      var m = el('msg');
+      m.textContent = text || '';
+      m.className = isError ? 'error' : '';
+    }
+    function setPanel(html) { el('panel').innerHTML = html; }
+    function setPanelClass(c) { el('panel').className = 'card ' + (c || ''); }
+
+    function poll() {
+      fetch('/api/ui-state').then(r => r.json()).then(function(d) {
+        if (d.status === 'ready') {
+          setPanelClass('success');
+          setPanel('<p><strong>Operacional</strong></p>' +
+            (d.device_id ? '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>' : ''));
+          return;
+        }
+        if (d.status === 'awaiting_code') {
+          setPanelClass(d.token_expired_alert ? 'alert' : '');
+          var title = d.token_expired_alert
+            ? '<p><strong>Sessão expirada.</strong> Foi enviado um novo código ao seu email. Introduza-o abaixo.</p>'
+            : '<p>Foi enviado um código ao seu email. Introduza-o abaixo.</p>';
+          setPanel(title +
+            '<input type="text" id="code" placeholder="Código (ex: 123456)" maxlength="8" autocomplete="one-time-code">' +
+            '<button type="button" id="btnVerify">Submeter código</button>');
+          el('btnVerify').onclick = submitCode;
+          el('code').onkeydown = function(e) { if (e.key === 'Enter') submitCode(); };
+          return;
+        }
+        setPanelClass('');
+        setPanel('<p>' + (d.message || 'Não autenticado') + '</p>' +
+          '<p>Configure <strong>email</strong> e <strong>password</strong> nas opções do addon no Home Assistant e reinicie. Depois clique abaixo para iniciar o login.</p>' +
+          '<button type="button" id="btnStart">Iniciar sessão</button>');
+        el('btnStart').onclick = startLogin;
+      }).catch(function() { setPanel('<p>Erro a obter estado. A recarregar...</p>'); });
+    }
+    function startLogin() {
+      el('btnStart').disabled = true;
+      fetch('/login/start', { method: 'POST' }).then(function() { poll(); }).finally(function() { el('btnStart').disabled = false; });
+    }
+    function submitCode() {
+      var code = (el('code') && el('code').value || '').trim();
+      if (!code) { showMsg('Introduza o código.', true); return; }
+      showMsg('A verificar...');
+      fetch('/login/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: code })
+      }).then(r => r.json()).then(function(res) {
+        if (res.ok) { showMsg('Login concluído.'); poll(); }
+        else { showMsg(res.error || 'Código inválido.', true); }
+      }).catch(function() { showMsg('Erro de rede.', true); });
+    }
+    poll();
+    setInterval(poll, 4000);
+  </script>
+</body>
+</html>"""
+    return html
+
+
 @app.route("/")
 def index():
-    """Página inicial com endpoints disponíveis."""
-    return (
-        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Motorline MConnect</title></head><body>"
-        "<h1>Motorline MConnect Add-on</h1>"
-        "<ul>"
-        "<li><a href='/health'>/health</a> – Estado do serviço</li>"
-        "<li><a href='/login/status'>/login/status</a> – Estado do login (awaiting_code / ready)</li>"
-        "<li>POST /login/verify – Submeter código do email (body: {\"code\": \"123456\"})</li>"
-        "<li>GET/POST <a href='/trigger'>/trigger</a> – Disparar portão</li>"
-        "</ul>"
-        "</body></html>"
-    ), 200, {"Content-Type": "text/html; charset=utf-8"}
+    """Painel do addon: login, código, estado operacional e alerta de sessão expirada."""
+    return _panel_html(), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/health")
@@ -237,12 +428,25 @@ def health():
 @app.route("/login/status", methods=["GET"])
 def login_status():
     """Indica se o add-on está à espera do código de verificação por email."""
-    global _awaiting_code, _token
+    global _awaiting_code, _token, _token_expired_alert
     if _awaiting_code:
-        return jsonify({"status": "awaiting_code", "message": "Abra o email e submeta o código em POST /login/verify"})
+        return jsonify({
+            "status": "awaiting_code",
+            "message": "Abra o email e introduza o código abaixo.",
+            "token_expired_alert": _token_expired_alert,
+        })
     if _token:
-        return jsonify({"status": "ready", "message": "Sessão ativa"})
+        return jsonify({"status": "ready", "message": "Sessão ativa", "token_expired_alert": False})
     return jsonify({"status": "not_logged_in", "message": "Faça login (ou aguarde renovação)"})
+
+
+@app.route("/login/start", methods=["POST"])
+def login_start():
+    """Inicia o fluxo de login (usa email/password das opções). Útil para o painel acordar o login."""
+    with _lock:
+        ensure_token()
+    st = login_status()
+    return st
 
 
 @app.route("/login/verify", methods=["POST"])
@@ -250,8 +454,9 @@ def login_verify():
     """
     Submete o código recebido por email para completar o login.
     Body JSON: {"code": "123456"} ou query ?code=123456
+    Se não houver device_id configurado, obtém a lista de dispositivos e guarda o primeiro.
     """
-    global _token, _token_expires_at
+    global _token, _token_expires_at, _token_expired_alert
     code = None
     if request.is_json and request.json:
         code = (request.json.get("code") or request.json.get("otp") or "").strip()
@@ -266,6 +471,21 @@ def login_verify():
 
     _token = token
     _token_expires_at = time.time() + expires_in
+    _token_expired_alert = False
+
+    opts = load_options()
+    device_id = (opts.get("device_id") or "").strip()
+    if not device_id:
+        devices = get_devices(token)
+        if len(devices) == 1:
+            device_id = devices[0].get("id", "")
+            if device_id:
+                save_state({"device_id": device_id})
+                logger.info("device_id obtido automaticamente: %s", device_id)
+        elif len(devices) > 1:
+            save_state({"device_id": devices[0].get("id", "")})
+            logger.info("Vários dispositivos; guardado o primeiro. Pode alterar em /api/device_id")
+
     return jsonify({"ok": True, "message": "Login concluído. Pode usar /trigger para o portão."})
 
 
@@ -316,4 +536,6 @@ def device_value():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
     logger.info("A iniciar servidor na porta %s", port)
+    t = threading.Thread(target=_background_tasks, daemon=True)
+    t.start()
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
