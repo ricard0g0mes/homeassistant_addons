@@ -138,6 +138,7 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
     return None, 0
 
 
+<<<<<<< Updated upstream
 def verify_code(code: str) -> tuple[str | None, int]:
     """
     Completa o login MFA com o código recebido por email.
@@ -207,6 +208,10 @@ def get_devices(token: str) -> list[dict]:
 
 def ensure_token() -> str | None:
     """Obtém um token válido (renovando se necessário). Se estiver à espera de código, retorna None."""
+=======
+def ensure_token() -> tuple[str | None, str]:
+    """Obtém um token válido (renovando se necessário). Retorna (token, mensagem_erro)."""
+>>>>>>> Stashed changes
     global _token, _token_expires_at
     if _awaiting_code:
         return None
@@ -215,22 +220,25 @@ def ensure_token() -> str | None:
     now = time.time()
 
     if _token and _token_expires_at > now + refresh_before:
-        return _token
+        return _token, ""
 
     api_base_url = opts.get("api_base_url", "https://api.mconnect.motorline.pt")
     email = opts.get("email", "")
     password = opts.get("password", "")
     if not email or not password:
-        logger.error("email ou password em falta nas opções")
-        return None
+        error_msg = "email ou password em falta nas opções"
+        logger.error(error_msg)
+        return None, error_msg
 
     token, expires_in = login(api_base_url, email, password)
     if not token:
-        return None
+        error_msg = "Login falhou - verifica email/password e endpoint da API. Consulta os logs para detalhes."
+        logger.error(error_msg)
+        return None, error_msg
 
     _token = token
     _token_expires_at = now + expires_in
-    return _token
+    return _token, ""
 
 
 def _background_tasks():
@@ -260,11 +268,15 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     url = f"{base}/devices/value/{device_id}"
 
     for attempt in range(2):
-        token = ensure_token()
+        token, error_msg = ensure_token()
         if not token:
+<<<<<<< Updated upstream
             if _awaiting_code:
                 return False, "À espera do código por email. Submeta em POST /login/verify com {\"code\": \"...\"}"
             return False, "Falha ao obter token"
+=======
+            return False, error_msg or "Falha ao obter token"
+>>>>>>> Stashed changes
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -533,6 +545,52 @@ def device_value():
     return jsonify({"ok": False, "error": err}), 502
 
 
+<<<<<<< Updated upstream
+=======
+@app.route("/test-login", methods=["GET", "POST"])
+def test_login():
+    """Endpoint de teste para verificar o login manualmente."""
+    opts = load_options()
+    api_base_url = opts.get("api_base_url", "https://api.mconnect.motorline.pt")
+    email = opts.get("email", "")
+    password = opts.get("password", "")
+    
+    if not email or not password:
+        return jsonify({
+            "ok": False, 
+            "error": "email ou password não configurados",
+            "config": {
+                "api_base_url": api_base_url,
+                "email_set": bool(email),
+                "password_set": bool(password)
+            }
+        }), 400
+    
+    logger.info("Teste de login iniciado para %s em %s", email, api_base_url)
+    token, expires_in = login(api_base_url, email, password)
+    
+    if token:
+        return jsonify({
+            "ok": True,
+            "token": token[:20] + "..." if len(token) > 20 else token,
+            "expires_in": expires_in,
+            "message": "Login bem-sucedido"
+        })
+    
+    return jsonify({
+        "ok": False, 
+        "error": "Login falhou - verifica email/password e endpoint da API",
+        "tried_endpoints": [
+            f"{api_base_url}/auth/login",
+            f"{api_base_url}/login",
+            f"{api_base_url}/api/auth/login",
+            f"{api_base_url}/api/login"
+        ],
+        "hint": "Consulta os logs do addon para ver detalhes das tentativas"
+    }), 401
+
+
+>>>>>>> Stashed changes
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
     logger.info("A iniciar servidor na porta %s", port)
