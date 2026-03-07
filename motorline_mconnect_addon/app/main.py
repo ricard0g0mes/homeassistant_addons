@@ -129,7 +129,10 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
         if r.status_code == 401 or _is_mfa_required_response(r.status_code, data):
             _awaiting_code = True
             _login_session = {"api_base_url": base, "email": email}
-            logger.info("MFA exigido. Código enviado por email. Use POST /login/verify com o código.")
+            for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
+                if data.get(key) is not None:
+                    _login_session[key] = data[key]
+            logger.info("MFA exigido. Resposta API: %s. Use POST /login/verify com o código.", data)
             return None, 0
         logger.warning("Login inesperado: status=%s body=%s", r.status_code, data)
     except Exception as e:
@@ -142,41 +145,60 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
 def verify_code(code: str) -> tuple[str | None, int]:
     """
     Completa o login MFA com o código recebido por email.
-    API Motorline: POST /user/mfa/verify com code, platform, model, uuid.
+    API Motorline: POST /user/mfa/verify (ou /auth/mfa/verify). Envia code, platform, model, uuid e qualquer session_id da resposta do login.
     Retorna (access_token, expires_in) ou (None, 0).
     """
     global _awaiting_code, _login_session
 
     if not _awaiting_code or not _login_session:
-        logger.error("Nenhum login à espera de código. Faça primeiro login (email/password).")
+        logger.error("Nenhum login à espera de código. Faça primeiro login (email/password) e espere o email antes de submeter o código.")
         return None, 0
 
     base = _login_session["api_base_url"]
-    url = f"{base}/user/mfa/verify"
+    code_clean = code.strip().replace(" ", "")
     payload = {
-        "code": code.strip(),
+        "code": code_clean,
+        "otp": code_clean,
         "platform": "HomeAssistant",
         "model": "addon",
         "uuid": MFA_DEVICE_UUID,
     }
-    try:
-        r = requests.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=15,
-        )
-        data = r.json() if r.text else {}
-        token = data.get("access_token") or data.get("token") or data.get("accessToken")
-        if r.status_code == 200 and token:
-            expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
+    for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
+        if _login_session.get(key) is not None:
+            payload[key] = _login_session[key]
+
+    def try_verify(url: str, body: dict) -> tuple[str | None, int]:
+        try:
+            r = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
+            data = r.json() if r.text else {}
+            token = data.get("access_token") or data.get("token") or data.get("accessToken")
+            if r.status_code == 200 and token:
+                exp = int(data.get("expires_in", data.get("expiresIn", 3600)))
+                return token, exp
+            logger.warning("MFA verify %s: status=%s body=%s", url, r.status_code, data)
+        except Exception as e:
+            logger.debug("MFA verify %s: %s", url, e)
+        return None, 0
+
+    for url in (f"{base}/user/mfa/verify", f"{base}/auth/mfa/verify", f"{base}/mfa/verify"):
+        token, exp = try_verify(url, payload)
+        if token:
             _awaiting_code = False
             _login_session = None
-            logger.info("MFA verificado, token obtido (expira em %s s)", expires_in)
-            return token, expires_in
-        logger.warning("MFA verify falhou: status=%s body=%s", r.status_code, data)
-    except Exception as e:
-        logger.debug("MFA verify falhou: %s", e)
+            logger.info("MFA verificado, token obtido (expira em %s s)", exp)
+            return token, exp
+
+    email = _login_session.get("email", "")
+    pwd = load_options().get("password", "")
+    if pwd:
+        token_body = {"grant_type": "authorization", "email": email, "password": pwd, "mfa_code": code_clean}
+        for url in (f"{base}/auth/token", f"{base}/oauth/token"):
+            token, exp = try_verify(url, token_body)
+            if token:
+                _awaiting_code = False
+                _login_session = None
+                logger.info("MFA via auth/token, token obtido")
+                return token, exp
 
     return None, 0
 
@@ -454,7 +476,7 @@ def _panel_html() -> str:
         body: JSON.stringify({ code: code })
       }).then(r => r.json()).then(function(res) {
         if (res.ok) { showMsg('Login concluído.'); poll(); }
-        else { showMsg(res.error || 'Código inválido.', true); }
+        else { showMsg((res.error || 'Código inválido.') + (res.hint ? ' ' + res.hint : ''), true); }
       }).catch(function() { showMsg('Erro de rede.', true); });
     }
     function saveDeviceId() {
@@ -542,7 +564,11 @@ def login_verify():
 
     token, expires_in = verify_code(code)
     if not token:
-        return jsonify({"ok": False, "error": "Código inválido ou API não respondeu com token"}), 400
+        return jsonify({
+            "ok": False,
+            "error": "Código inválido ou API não respondeu com token. O código pode ter expirado (vários minutos).",
+            "hint": "Clique em 'Tentar novamente', espere o novo email e introduza o código de imediato. Consulte os logs do addon para detalhes da API.",
+        }), 400
 
     _token = token
     _token_expires_at = time.time() + expires_in
