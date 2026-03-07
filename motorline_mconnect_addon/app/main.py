@@ -366,8 +366,8 @@ def _get_rooms(token: str) -> list[dict]:
     return []
 
 
-# Valores reais da API para o portão: 0=fechado, 2=aberto, 6=a fechar, 8=a abrir
-GATE_STATE_MAP = {0: "fechado", 2: "aberto", 6: "a_fechar", 8: "a_abrir"}
+# Valores reais da API para o portão: 0=fechado, 2=aberto, 6=fechando, 8=abrindo
+GATE_STATE_MAP = {0: "fechado", 2: "aberto", 6: "fechando", 8: "abrindo"}
 
 
 def gate_value_to_state(raw_value: int | float) -> str:
@@ -379,7 +379,7 @@ def gate_value_to_state(raw_value: int | float) -> str:
 def get_gate_state(device_id: str, token: str) -> dict | None:
     """
     Estado do portão. GET /rooms → devices[].values[] com value_id "gate_state".
-    Retorna {"value": raw (0/2/6/8), "state": "fechado"|"aberto"|"a_fechar"|"a_abrir", "unit": "%"}.
+    Retorna {"value": raw (0/2/6/8), "state": "fechado"|"aberto"|"fechando"|"abrindo", "unit": "%"}.
     """
     for room in _get_rooms(token):
         for d in room.get("devices", []):
@@ -653,7 +653,7 @@ def api_set_token():
 @app.route("/api/gate-state", methods=["GET"])
 def api_gate_state():
     """
-    Sensor do portão: estado (fechado/aberto/a_fechar/a_abrir) e valor bruto (0/2/6/8).
+    Sensor do portão: estado (fechado/aberto/fechando/abrindo) e valor bruto (0/2/6/8).
     Para HA: GET /api/gate-state → value (0,2,6,8), state (string).
     """
     opts = load_options()
@@ -773,7 +773,7 @@ def _panel_html() -> str:
           var html = '<p><strong>Operacional</strong></p>';
           if (d.device_id) {
             html += '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>';
-            if (d.gate_state_state !== undefined) html += '<p>Estado do portão: <strong>' + (d.gate_state_state === 'fechado' ? 'Fechado' : d.gate_state_state === 'aberto' ? 'Aberto' : d.gate_state_state === 'a_fechar' ? 'A fechar' : d.gate_state_state === 'a_abrir' ? 'A abrir' : d.gate_state_state) + '</strong></p>';
+            if (d.gate_state_state !== undefined) html += '<p>Estado do portão: <strong>' + (d.gate_state_state === 'fechado' ? 'Fechado' : d.gate_state_state === 'aberto' ? 'Aberto' : d.gate_state_state === 'fechando' ? 'Fechando' : d.gate_state_state === 'abrindo' ? 'Abrindo' : d.gate_state_state) + '</strong></p>';
             html += '<p><button type="button" id="btnTrigger">Disparar portão</button></p>';
             if (d.token_expired_alert) html += '<p class="alert" style="margin:0.5rem 0 0 0; padding:0.5rem;">Sessão expirada. Use o botão abaixo para receber um novo código por email.</p>';
             html += '<p style="margin-top:0.5rem;"><button type="button" id="btnRenew" style="background:#6c757d;">Pedir novo código por email</button></p>';
