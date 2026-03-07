@@ -347,11 +347,20 @@ def _get_rooms(token: str) -> list[dict]:
     return []
 
 
+# Valores reais da API para o portão: 0=fechado, 2=aberto, 6=a fechar, 8=a abrir
+GATE_STATE_MAP = {0: "fechado", 2: "aberto", 6: "a_fechar", 8: "a_abrir"}
+
+
+def gate_value_to_state(raw_value: int | float) -> str:
+    """Converte o valor bruto da API (0, 2, 6, 8) no estado do portão."""
+    v = int(raw_value) if raw_value is not None else 0
+    return GATE_STATE_MAP.get(v, "desconhecido")
+
+
 def get_gate_state(device_id: str, token: str) -> dict | None:
     """
-    Posição atual do portão (como na página Motorline).
-    GET /rooms → devices[].values[] com value_id "gate_state".
-    Retorna {"value": 0-100, "unit": "%"} ou None.
+    Estado do portão. GET /rooms → devices[].values[] com value_id "gate_state".
+    Retorna {"value": raw (0/2/6/8), "state": "fechado"|"aberto"|"a_fechar"|"a_abrir", "unit": "%"}.
     """
     for room in _get_rooms(token):
         for d in room.get("devices", []):
@@ -362,7 +371,12 @@ def get_gate_state(device_id: str, token: str) -> dict | None:
                 continue
             for v in d.get("values", []):
                 if isinstance(v, dict) and v.get("value_id") == "gate_state":
-                    return {"value": v.get("value", 0), "unit": v.get("unit", "%")}
+                    raw = v.get("value", 0)
+                    return {
+                        "value": raw,
+                        "state": gate_value_to_state(raw),
+                        "unit": v.get("unit", "%"),
+                    }
     return None
 
 
@@ -502,6 +516,7 @@ def api_ui_state():
             gate = get_gate_state(device_id, token)
             if gate is not None:
                 out["gate_state"] = gate.get("value", 0)
+                out["gate_state_state"] = gate.get("state", "desconhecido")
                 out["gate_state_unit"] = gate.get("unit", "%")
     return jsonify(out)
 
@@ -524,7 +539,10 @@ def api_set_token():
 
 @app.route("/api/gate-state", methods=["GET"])
 def api_gate_state():
-    """Posição atual do portão (sensor). GET /rooms → gate_state value (0–100%)."""
+    """
+    Sensor do portão: estado (fechado/aberto/a_fechar/a_abrir) e valor bruto (0/2/6/8).
+    Para HA: GET /api/gate-state → value (0,2,6,8), state (string).
+    """
     opts = load_options()
     device_id = (opts.get("device_id") or "").strip()
     if not device_id:
@@ -535,7 +553,12 @@ def api_gate_state():
     gate = get_gate_state(device_id, token)
     if gate is None:
         return jsonify({"ok": False, "error": "Dispositivo ou gate_state não encontrado"}), 404
-    return jsonify({"ok": True, "value": gate.get("value", 0), "unit": gate.get("unit", "%")})
+    return jsonify({
+        "ok": True,
+        "value": gate.get("value", 0),
+        "state": gate.get("state", "desconhecido"),
+        "unit": gate.get("unit", "%"),
+    })
 
 
 @app.route("/api/devices", methods=["GET"])
@@ -637,7 +660,7 @@ def _panel_html() -> str:
           var html = '<p><strong>Operacional</strong></p>';
           if (d.device_id) {
             html += '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>';
-            if (d.gate_state !== undefined) html += '<p>Posição do portão: <strong>' + d.gate_state + (d.gate_state_unit || '%') + '</strong></p>';
+            if (d.gate_state_state !== undefined) html += '<p>Estado do portão: <strong>' + (d.gate_state_state === 'fechado' ? 'Fechado' : d.gate_state_state === 'aberto' ? 'Aberto' : d.gate_state_state === 'a_fechar' ? 'A fechar' : d.gate_state_state === 'a_abrir' ? 'A abrir' : d.gate_state_state) + '</strong></p>';
             html += '<p><button type="button" id="btnTrigger">Disparar portão</button></p>';
             if (d.token_expired_alert) html += '<p class="alert" style="margin:0.5rem 0 0 0; padding:0.5rem;">Sessão expirada. Use o botão abaixo para receber um novo código por email.</p>';
             html += '<p style="margin-top:0.5rem;"><button type="button" id="btnRenew" style="background:#6c757d;">Pedir novo código por email</button></p>';
@@ -845,18 +868,22 @@ def login_verify():
     _token_expired_alert = False
 
     device_id = (load_options().get("device_id") or "").strip()
-    device_token, device_exp = exchange_for_device_token(user_token, home_token, home_id or "", device_id) if device_id else (None, 0)
-    if device_token:
-        _token = device_token
-        _token_expires_at = time.time() + device_exp
-    elif home_token:
+    # O token que funciona em rest.mconnect.pt/devices/value é o da casa (home_token)
+    if home_token:
         _token = home_token
         _token_expires_at = time.time() + home_expires
+        logger.info("Token da casa guardado para comando do portão (expira em %s s)", home_expires)
         if home_id:
             save_state({"home_id": home_id})
     else:
-        _token = user_token
-        _token_expires_at = time.time() + expires_in
+        device_token, device_exp = exchange_for_device_token(user_token, home_token, home_id or "", device_id) if device_id else (None, 0)
+        if device_token:
+            _token = device_token
+            _token_expires_at = time.time() + device_exp
+        else:
+            _token = user_token
+            _token_expires_at = time.time() + expires_in
+            logger.warning("Token da casa não obtido; a usar token de utilizador. Se o comando falhar, cole o token manualmente na configuração.")
     save_state({
         "token": _token,
         "token_expires_at": _token_expires_at,
