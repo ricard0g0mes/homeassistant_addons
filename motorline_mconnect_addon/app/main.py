@@ -13,6 +13,11 @@ import time
 from pathlib import Path
 
 import requests
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 from flask import Flask, jsonify, request
 
 logging.basicConfig(
@@ -47,6 +52,8 @@ _login_session = None  # {"api_base_url", "email"}
 # Alerta para o painel: sessão expirou e é preciso novo código (verificação horária)
 _token_expired_alert = False
 _lock = threading.Lock()
+# Evitar vários logins em paralelo (vários emails): lock em ficheiro (vale entre threads e processos)
+_LOGIN_LOCK_PATH = DATA_DIR / ".motorline_login.lock"
 
 
 def load_options():
@@ -293,8 +300,31 @@ def get_devices(token: str) -> list[dict]:
     return []
 
 
+def _acquire_login_file_lock():
+    """Lock exclusivo em ficheiro (entre threads e processos). Retorna fd ou None se já houver login a correr."""
+    if not fcntl:
+        return None
+    path = _LOGIN_LOCK_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (OSError, BlockingIOError):
+        return None
+
+def _release_login_file_lock(fd):
+    if fd is None:
+        return
+    try:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    except Exception:
+        pass
+
 def ensure_token() -> tuple[str | None, str]:
-    """Obtém um token válido (renovando se necessário). Retorna (token, mensagem_erro). Só uma chamada a login() por vez (lock)."""
+    """Obtém um token válido (renovando se necessário). Só uma chamada a login() por vez (lock em ficheiro)."""
     global _token, _token_expires_at
     if _awaiting_code:
         return None, "À espera do código por email"
@@ -310,18 +340,25 @@ def ensure_token() -> tuple[str | None, str]:
     if not email or not password:
         return None, "Introduza email e password no painel"
 
-    with _lock:
-        if _awaiting_code:
-            return None, "À espera do código por email"
-        if _token and _token_expires_at > now + refresh_before:
-            return _token, ""
+    fd = _acquire_login_file_lock()
+    if fd is None:
+        return None, "Login já em curso (aguarde o email)"
+    try:
+        with _lock:
+            if _awaiting_code:
+                return None, "À espera do código por email"
+            if _token and _token_expires_at > now + refresh_before:
+                return _token, ""
         api_base_url = opts.get("api_base_url", API_BASE_URL)
         token, expires_in = login(api_base_url, email, password)
-        if not token:
-            return None, "Login falhou (verifica credenciais ou consulta os logs)"
-        _token = token
-        _token_expires_at = now + expires_in
-        return _token, ""
+        with _lock:
+            if token:
+                _token = token
+                _token_expires_at = time.time() + expires_in
+                return _token, ""
+        return None, "Login falhou (verifica credenciais ou consulta os logs)"
+    finally:
+        _release_login_file_lock(fd)
 
 
 def _background_tasks():
