@@ -20,7 +20,7 @@ options:
   mqtt_user: ""
   mqtt_password: ""
 schema:
-  mqtt_enabled: "boolean?"
+  mqtt_enabled: "bool?"
   mqtt_host: "str?"
   mqtt_port: "port?"
   mqtt_user: "str?"
