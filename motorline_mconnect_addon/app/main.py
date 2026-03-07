@@ -59,7 +59,7 @@ _LOGIN_LOCK_PATH = DATA_DIR / ".motorline_login.lock"
 
 
 def load_options():
-    """Configuração vem do state (email, password, device_id). API URL e refresh são constantes."""
+    """Configuração vem do state (email, password, device_id, token)."""
     state = load_state()
     return {
         "api_base_url": API_BASE_URL,
@@ -67,6 +67,8 @@ def load_options():
         "email": (state.get("email") or "").strip(),
         "password": state.get("password") or "",
         "device_id": (state.get("device_id") or "").strip(),
+        "token": (state.get("token") or "").strip() or None,
+        "token_expires_at": state.get("token_expires_at") or 0,
     }
 
 
@@ -336,13 +338,20 @@ def _release_login_file_lock(fd):
         pass
 
 def ensure_token() -> tuple[str | None, str]:
-    """Retorna o token se válido. Nunca chama login() — o código só é pedido quando o utilizador clica em 'Pedir código por email' no painel."""
+    """Retorna o token se válido (memória ou state). Nunca chama login() — o código só é pedido quando o utilizador clica em 'Pedir código por email'."""
+    global _token, _token_expires_at
     if _awaiting_code:
         return None, "À espera do código por email"
     opts = load_options()
     refresh_before = int(opts.get("refresh_before_expiry_seconds", REFRESH_BEFORE_EXPIRY_SECONDS))
     now = time.time()
     if _token and _token_expires_at > now + refresh_before:
+        return _token, ""
+    # Hidratar a partir do state (ex.: após reinício do addon)
+    persisted = opts.get("token")
+    persisted_exp = float(opts.get("token_expires_at") or 0)
+    if persisted and persisted_exp > now + refresh_before:
+        _token, _token_expires_at = persisted, persisted_exp
         return _token, ""
     if not (opts.get("email") or "").strip() or not opts.get("password"):
         return None, "Introduza email e password no painel"
@@ -403,25 +412,15 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     if ok:
         return True, ""
 
-    _token, _token_expires_at = None, 0.0
-
-    # 2) Fallback: token de utilizador (algumas APIs aceitam este em api.mconnect.motorline.pt)
+    # 2) Fallback: token de utilizador
     if _user_token and _user_token_expires_at > time.time():
         ok, status2, err2 = _post_device_value(device_id, num, _user_token, "Jwt")
         if ok:
             return True, ""
         logger.warning("devices/value 401 também com user_token. Resposta: %s", err2)
 
-    # 3) Renovar e tentar de novo uma vez
-    token2, _ = ensure_token()
-    if token2:
-        ok, status3, err3 = _post_device_value(device_id, num, token2, "Jwt")
-        if ok:
-            return True, ""
-        if status3 == 401:
-            logger.warning("devices/value 401 após renovação. Resposta: %s", err3)
-
-    return False, "401 na API do portão (token pode não ser aceite por api.mconnect.motorline.pt). Consulte os logs."
+    # Não limpar _token: o painel continua "Operacional"; o utilizador vê o erro e pode clicar em "Pedir código por email" quando quiser.
+    return False, "401 na API do portão — token expirado ou inválido. Clique em 'Pedir código por email' no painel para obter um novo."
 
 
 @app.route("/api/ui-state", methods=["GET"])
@@ -715,6 +714,7 @@ def login_verify():
     _user_token = user_token
     _user_token_expires_at = time.time() + (home_expires if home_token else expires_in)
     _token_expired_alert = False
+    save_state({"token": _token, "token_expires_at": _token_expires_at})
 
     opts = load_options()
     device_id = (opts.get("device_id") or "").strip()
@@ -777,6 +777,12 @@ def device_value():
 
 
 if __name__ == "__main__":
+    # Carregar token persistido para sobreviver a reinícios
+    opts = load_options()
+    if opts.get("token") and (opts.get("token_expires_at") or 0) > time.time():
+        _token = opts["token"]
+        _token_expires_at = float(opts["token_expires_at"])
+        logger.info("Token restaurado do state")
     port = int(os.environ.get("PORT", 8765))
     logger.info("A iniciar servidor na porta %s", port)
     t = threading.Thread(target=_background_tasks, daemon=True)
