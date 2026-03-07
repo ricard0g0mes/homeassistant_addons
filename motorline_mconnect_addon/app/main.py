@@ -42,8 +42,10 @@ REFRESH_BEFORE_EXPIRY_SECONDS = 300
 app = Flask(__name__)
 
 # Estado do token (em memória; renovado ao receber 401 ou antes do expiry)
-_token = None
+_token = None  # token da casa (rest) ou user (fallback para api dispositivos)
 _token_expires_at = 0.0
+_user_token = None  # token de utilizador (fallback para api.mconnect.motorline.pt se home der 401)
+_user_token_expires_at = 0.0
 
 # Login em 2 fases: quando a API envia código por email
 _awaiting_code = False
@@ -375,45 +377,66 @@ def _background_tasks():
             logger.warning("Token expirado ou inválido. É necessário novo código por email.")
 
 
+def _post_device_value(device_id: str, num: int, token: str, auth_scheme: str = "Jwt") -> tuple[bool, int, str]:
+    """Faz POST para /devices/value. Retorna (ok, status_code, erro ou '')."""
+    base = DEVICES_API_BASE_URL.rstrip("/")
+    url = f"{base}/devices/value/{device_id}"
+    headers = {
+        "Authorization": f"{auth_scheme} {token}",
+        "Content-Type": "application/json",
+        "Timezone": "Europe/Lisbon",
+    }
+    r = requests.post(url, json={"value_id": "gate_state", "value": num}, headers=headers, timeout=15)
+    if r.status_code in (200, 204):
+        return True, r.status_code, ""
+    return False, r.status_code, r.text[:300] if r.text else ""
+
+
 def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, str]:
     """
     Define o valor do dispositivo (portão). Endpoint em api.mconnect.motorline.pt.
-    Header: Authorization "Jwt <token>", body: {"value_id": "gate_state", "value": 2} (2 = abrir).
+    Tenta primeiro com token da casa (Jwt); em 401 tenta com token de utilizador (Jwt).
     """
     global _token, _token_expires_at
     base = DEVICES_API_BASE_URL.rstrip("/")
-    url = f"{base}/devices/value/{device_id}"
-    # value 2 = abrir (confirmado pelo utilizador); 1 ou outro mantém compatibilidade
     num = 2 if value in (1, "1", "open") else int(value) if isinstance(value, (int, float)) else 2
 
-    for attempt in range(2):
-        token, error_msg = ensure_token()
-        if not token:
-            return False, error_msg or "Falha ao obter token"
+    token, error_msg = ensure_token()
+    if not token:
+        return False, error_msg or "Falha ao obter token"
 
-        headers = {
-            "Authorization": f"Jwt {token}",
-            "Content-Type": "application/json",
-            "Timezone": "Europe/Lisbon",
-        }
-        try:
-            r = requests.post(
-                url,
-                json={"value_id": "gate_state", "value": num},
-                headers=headers,
-                timeout=15,
-            )
-            if r.status_code == 401:
-                logger.warning("Token expirado (401), a renovar...")
-                _token, _token_expires_at = None, 0.0
-                continue
-            if r.status_code in (200, 204):
-                return True, ""
-            return False, f"HTTP {r.status_code}: {r.text[:200]}"
-        except requests.RequestException as e:
-            return False, str(e)
+    # 1) Tentar com token principal (casa) — Jwt
+    ok, status, err = _post_device_value(device_id, num, token, "Jwt")
+    if ok:
+        return True, ""
+    if status != 401:
+        logger.warning("devices/value: HTTP %s %s", status, err)
+        return False, f"HTTP {status}: {err}"
 
-    return False, "401 após renovação de token"
+    logger.warning("devices/value 401 (Jwt). Resposta: %s", err)
+    ok, status, _ = _post_device_value(device_id, num, token, "Bearer")
+    if ok:
+        return True, ""
+
+    _token, _token_expires_at = None, 0.0
+
+    # 2) Fallback: token de utilizador (algumas APIs aceitam este em api.mconnect.motorline.pt)
+    if _user_token and _user_token_expires_at > time.time():
+        ok, status2, err2 = _post_device_value(device_id, num, _user_token, "Jwt")
+        if ok:
+            return True, ""
+        logger.warning("devices/value 401 também com user_token. Resposta: %s", err2)
+
+    # 3) Renovar e tentar de novo uma vez
+    token2, _ = ensure_token()
+    if token2:
+        ok, status3, err3 = _post_device_value(device_id, num, token2, "Jwt")
+        if ok:
+            return True, ""
+        if status3 == 401:
+            logger.warning("devices/value 401 após renovação. Resposta: %s", err3)
+
+    return False, "401 na API do portão (token pode não ser aceite por api.mconnect.motorline.pt). Consulte os logs."
 
 
 @app.route("/api/ui-state", methods=["GET"])
@@ -657,7 +680,7 @@ def login_verify():
     Body JSON: {"code": "123456"} ou query ?code=123456
     Se não houver device_id configurado, obtém a lista de dispositivos e guarda o primeiro.
     """
-    global _token, _token_expires_at, _token_expired_alert
+    global _token, _token_expires_at, _token_expired_alert, _user_token, _user_token_expires_at
     code = None
     if request.is_json and request.json:
         code = (request.json.get("code") or request.json.get("otp") or "").strip()
@@ -683,6 +706,8 @@ def login_verify():
     else:
         _token = user_token
         _token_expires_at = time.time() + expires_in
+    _user_token = user_token
+    _user_token_expires_at = time.time() + (home_expires if home_token else expires_in)
     _token_expired_alert = False
 
     opts = load_options()

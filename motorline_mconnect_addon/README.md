@@ -36,7 +36,7 @@ maintainer: Teu Nome
 ## Utilização (sem configuração no HA)
 
 1. **Instala** o addon e **inicia-o**. Não é necessário preencher nenhuma opção nas definições do addon.
-2. Abre o **painel web**: **Add-ons** → **Motorline MConnect** → **Abrir painel web** (ou `http://<addon>:8765/`).
+2. Abre o **painel web**: **Add-ons** → **Motorline MConnect** → **Abrir painel web** (ou `http://<addon>:8765/`). Se acederes pela rede local, usa o IP do Home Assistant, por exemplo: **http://192.168.1.133:8765/**.
 3. No **primeiro arranque** o painel pede **email** e **password** da conta Motorline MConnect. Introduz e clica em **Iniciar sessão**.
 4. Se a API enviar um **código por email**, o painel mostra o campo para o código. Introduz o código recebido e clica em **Submeter código**.
 5. O **device_id** é obtido automaticamente (um dispositivo) ou guardado o primeiro da lista. Ficas **Operacional**.
@@ -137,6 +137,8 @@ Ou num dashboard: **Entidades** → **Criar botão** → Ação: **Chamar servi�
 ```
 POST http://<IP_HA>:8765/trigger
 ```
+
+Exemplo com o IP do HA na rede local: `http://192.168.1.133:8765/trigger`.  
 (Se expuseres a porta 8765 no addon; por segurança preferir usar apenas dentro da rede e, se possível, só via REST command no HA.)
 
 ## Validade do token
