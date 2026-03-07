@@ -365,17 +365,26 @@ def _panel_html() -> str:
     function poll() {
       fetch('/api/ui-state').then(r => r.json()).then(function(d) {
         if (d.status === 'ready') {
+          if (!d.device_id && el('deviceIdInput')) return;
           setPanelClass('success');
-          setPanel('<p><strong>Operacional</strong></p>' +
-            (d.device_id ? '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>' : ''));
+          var html = '<p><strong>Operacional</strong></p>';
+          if (d.device_id) {
+            html += '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>';
+            html += '<p><button type="button" id="btnTrigger">Disparar portão</button></p>';
+          } else {
+            html += '<p class="alert" style="margin:0 0 0.75rem 0; padding:0.5rem;">ID do dispositivo não foi obtido. Introduza-o abaixo (ex: 66755146c8a511e8645bd710). Pode encontrá-lo na app Motorline ou no URL do dispositivo.</p>';
+            html += '<input type="text" id="deviceIdInput" placeholder="ID do dispositivo (device_id)" style="margin-bottom:0.5rem;">';
+            html += '<button type="button" id="btnSaveDevice">Guardar ID</button>';
+          }
+          setPanel(html);
+          if (el('btnTrigger')) el('btnTrigger').onclick = triggerGate;
+          if (el('btnSaveDevice')) { el('btnSaveDevice').onclick = saveDeviceId; el('deviceIdInput').onkeydown = function(e) { if (e.key === 'Enter') saveDeviceId(); }; }
           return;
         }
         if (d.status === 'awaiting_code') {
+          if (el('code') && el('btnVerify')) return;
           setPanelClass(d.token_expired_alert ? 'alert' : '');
-          var title = d.token_expired_alert
-            ? '<p><strong>Sessão expirada.</strong> Foi enviado um novo código ao seu email. Introduza-o abaixo.</p>'
-            : '<p>Foi enviado um código ao seu email. Introduza-o abaixo.</p>';
-          setPanel(title +
+          setPanel('<p><strong>Foi enviado um código ao seu email.</strong> Introduza-o abaixo para concluir o login.</p>' +
             '<input type="text" id="code" placeholder="Código (ex: 123456)" maxlength="8" autocomplete="one-time-code">' +
             '<button type="button" id="btnVerify">Submeter código</button>');
           el('btnVerify').onclick = submitCode;
@@ -394,11 +403,25 @@ def _panel_html() -> str:
           if (el('password')) el('password').onkeydown = function(e) { if (e.key === 'Enter') submitLogin(); };
           return;
         }
+        if (el('code') && el('btnVerify')) return;
         setPanelClass('');
         setPanel('<p>' + (d.message || 'Não autenticado') + '</p>' +
-          '<button type="button" id="btnStart">Tentar novamente</button>');
+          '<p><strong>Se recebeu um código por email</strong>, introduza-o abaixo (o addon está à espera):</p>' +
+          '<input type="text" id="code" placeholder="Código (ex: 123456)" maxlength="8" autocomplete="one-time-code">' +
+          '<button type="button" id="btnVerify">Submeter código</button>' +
+          '<p style="margin-top:1rem;"><button type="button" id="btnStart">Tentar novamente (reenviar email)</button></p>');
+        el('btnVerify').onclick = submitCode;
+        if (el('code')) el('code').onkeydown = function(e) { if (e.key === 'Enter') submitCode(); };
         el('btnStart').onclick = startLogin;
       }).catch(function() { setPanel('<p>Erro a obter estado. A recarregar...</p>'); });
+    }
+    function showCodeForm() {
+      setPanelClass('');
+      setPanel('<p><strong>Foi enviado um código ao seu email.</strong> Introduza-o abaixo para concluir o login.</p>' +
+        '<input type="text" id="code" placeholder="Código (ex: 123456)" maxlength="8" autocomplete="one-time-code">' +
+        '<button type="button" id="btnVerify">Submeter código</button>');
+      el('btnVerify').onclick = submitCode;
+      if (el('code')) { el('code').focus(); el('code').onkeydown = function(e) { if (e.key === 'Enter') submitCode(); }; }
     }
     function submitLogin() {
       var email = (el('email') && el('email').value || '').trim();
@@ -410,7 +433,11 @@ def _panel_html() -> str:
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: email, password: password })
-      }).then(function() { showMsg(''); poll(); }).catch(function() { showMsg('Erro de rede.', true); });
+      }).then(r => r.json()).then(function(data) {
+        showMsg('');
+        if (data.status === 'awaiting_code') showCodeForm();
+        else poll();
+      }).catch(function() { showMsg('Erro de rede.', true); });
     }
     function startLogin() {
       var btn = el('btnStart');
@@ -429,6 +456,26 @@ def _panel_html() -> str:
         if (res.ok) { showMsg('Login concluído.'); poll(); }
         else { showMsg(res.error || 'Código inválido.', true); }
       }).catch(function() { showMsg('Erro de rede.', true); });
+    }
+    function saveDeviceId() {
+      var id = (el('deviceIdInput') && el('deviceIdInput').value || '').trim();
+      if (!id) { showMsg('Introduza o ID do dispositivo.', true); return; }
+      showMsg('A guardar...');
+      fetch('/api/device_id', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: id })
+      }).then(r => r.json()).then(function(res) {
+        if (res.ok) { showMsg('ID guardado.'); poll(); }
+        else { showMsg(res.error || 'Erro.', true); }
+      }).catch(function() { showMsg('Erro de rede.', true); });
+    }
+    function triggerGate() {
+      var btn = el('btnTrigger');
+      if (btn) btn.disabled = true;
+      fetch('/trigger', { method: 'POST' }).then(r => r.json()).then(function(res) {
+        showMsg(res.ok ? 'Comando enviado.' : (res.error || 'Erro'), !res.ok);
+      }).catch(function() { showMsg('Erro de rede.', true); }).finally(function() { if (btn) btn.disabled = false; });
     }
     poll();
     setInterval(poll, 4000);
