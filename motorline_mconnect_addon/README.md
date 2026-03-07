@@ -44,6 +44,19 @@ maintainer: Teu Nome
 
 Tudo (credenciais, device_id) fica guardado em `/data/` dentro do addon. A URL da API e o intervalo de renovação são internos.
 
+## Sensor e botão no Home Assistant (MQTT)
+
+Para ter **entidades nativas** no HA (sensor de estado do portão e botão para abrir) para automações e Node-RED, **ativa o MQTT** nas opções do addon:
+
+1. Instala o addon **Mosquitto broker** (Supervisor → Add-on Store → Mosquitto broker) e inicia-o, se ainda não tiveres.
+2. No addon **Motorline MConnect**: **Configuração** → ativa **mqtt_enabled**; ajusta **mqtt_host** se for preciso (por defeito `core-mosquitto`). Se o teu broker tiver autenticação, preenche **mqtt_user** e **mqtt_password**.
+3. Reinicia o addon Motorline MConnect.
+4. Em **Definições** → **Dispositivos e serviços** → **MQTT** (integração já deve estar ativa com o Mosquitto). O addon publica **MQTT discovery**: em breve devem aparecer:
+   - **Sensor**: «Portão Motorline Estado» (estado: fechado / aberto / a_fechar / a_abrir)
+   - **Botão**: «Portão Motorline Abrir» (ao premir, dispara o portão)
+
+Não é preciso criar manualmente `rest_command` nem templates. Usa estas entidades em automações, dashboards e Node-RED como qualquer outra.
+
 ## Endpoints do addon (porta 8765)
 
 - **GET/POST** `http://<host>:8765/trigger` ou `/command`  
@@ -69,13 +82,19 @@ Tudo (credenciais, device_id) fica guardado em `/data/` dentro do addon. A URL d
   Body: `{"code": "123456"}` — submete o código recebido por email para concluir o login.
 
 - **GET** `http://<host>:8765/api/ui-state`  
-  Estado para o painel: `status`, `token_expired_alert`, `device_id`.
+  Estado para o painel: `status`, `token_expired_alert`, `device_id`, `gate_state_state`, etc.
+
+- **GET** `http://<host>:8765/api/gate-state`  
+  Sensor do portão: `value` (0/2/6/8), `state` (fechado/aberto/a_fechar/a_abrir).
 
 - **GET** `http://<host>:8765/api/devices`  
   Lista dispositivos (requer token).
 
 - **POST** `http://<host>:8765/api/device_id`  
   Body: `{"device_id": "..."}` — guarda o ID do dispositivo (persistente em `/data/`).
+
+- **POST** `http://<host>:8765/api/token`  
+  Body: `{"token": "..."}` — guarda token manualmente (útil se o login automático falhar).
 
 Dentro do HA, o host do addon é normalmente o nome do addon (ex.: `a0d7b954_motorline_mconnect`) ou `localhost` se acederes a partir do próprio HA.
 

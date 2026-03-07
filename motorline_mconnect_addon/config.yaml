@@ -1,6 +1,6 @@
 name: Motorline MConnect
 description: Proxy para API Motorline MConnect. Instala, inicia e configura no painel (login e código por email).
-version: "1.5.2"
+version: "1.5.3"
 slug: motorline_mconnect
 arch:
   - aarch64
@@ -13,5 +13,15 @@ ports:
   8765/tcp: 8765
 ports_description:
   8765/tcp: Painel e API local para o portão
-options: {}
-schema: {}
+options:
+  mqtt_enabled: false
+  mqtt_host: core-mosquitto
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+schema:
+  mqtt_enabled: "boolean?"
+  mqtt_host: "str?"
+  mqtt_port: "port?"
+  mqtt_user: "str?"
+  mqtt_password: "password?"

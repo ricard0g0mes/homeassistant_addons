@@ -18,6 +18,10 @@ try:
     import fcntl
 except ImportError:
     fcntl = None
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    mqtt = None
 from flask import Flask, jsonify, request
 
 logging.basicConfig(
@@ -56,6 +60,21 @@ _token_expired_alert = False
 _lock = threading.Lock()
 # Evitar vários logins em paralelo (vários emails): lock em ficheiro (vale entre threads e processos)
 _LOGIN_LOCK_PATH = DATA_DIR / ".motorline_login.lock"
+
+# Opções do addon (HA injeta em /data/options.json)
+ADDON_OPTIONS_PATH = DATA_DIR / "options.json"
+
+
+def load_addon_options() -> dict:
+    """Lê opções do addon (MQTT, etc.) de /data/options.json (injetado pelo HA)."""
+    if not ADDON_OPTIONS_PATH.exists():
+        return {}
+    try:
+        with open(ADDON_OPTIONS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.debug("load_addon_options: %s", e)
+        return {}
 
 
 def load_options():
@@ -450,6 +469,100 @@ def _background_tasks():
         if (not _token or _token_expires_at <= now) and not _awaiting_code:
             _token_expired_alert = True
             logger.warning("Token expirado. Abra o painel e clique em 'Pedir código por email' para obter um novo código.")
+
+
+# Tópicos MQTT para o HA descobrir sensor e botão
+MQTT_TOPIC_STATE = "motorline/portao/state"
+MQTT_TOPIC_COMMAND = "motorline/portao/command"
+MQTT_DISCOVERY_PREFIX = "homeassistant"
+
+
+def _mqtt_publish_state(client: "mqtt.Client") -> None:
+    """Publica estado do portão no tópico state (para o sensor no HA)."""
+    opts = load_options()
+    device_id = (opts.get("device_id") or "").strip()
+    if not device_id:
+        return
+    token, _ = ensure_token()
+    if not token:
+        return
+    gate = get_gate_state(device_id, token)
+    if gate is None:
+        return
+    payload = json.dumps({"state": gate.get("state", "desconhecido"), "value": gate.get("value", 0)})
+    client.publish(MQTT_TOPIC_STATE, payload, retain=True)
+
+
+def _mqtt_thread() -> None:
+    """Conecta ao broker, publica discovery (sensor + botão), subscreve comando e publica estado periodicamente."""
+    if not mqtt:
+        return
+    addon = load_addon_options()
+    if not addon.get("mqtt_enabled"):
+        return
+    host = str(addon.get("mqtt_host", "core-mosquitto")).strip()
+    port = int(addon.get("mqtt_port", 1883))
+    user = (addon.get("mqtt_user") or "").strip()
+    password = (addon.get("mqtt_password") or "").strip()
+    if not host:
+        return
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+        client_id="motorline_mconnect_addon",
+    )
+    if user:
+        client.username_pw_set(user, password or None)
+
+    def on_connect(c, userdata, flags, reason_code):
+        if reason_code != 0:
+            logger.warning("MQTT conexão falhou: %s", reason_code)
+            return
+        logger.info("MQTT ligado ao broker %s:%s", host, port)
+        # Discovery: sensor de estado
+        device = {"identifiers": ["motorline_mconnect"], "name": "Motorline MConnect"}
+        sensor_config = {
+            "name": "Portão Motorline Estado",
+            "state_topic": MQTT_TOPIC_STATE,
+            "value_template": "{{ value_json.state }}",
+            "unique_id": "motorline_portao_estado",
+            "device": device,
+        }
+        c.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/motorline_portao_estado/config", json.dumps(sensor_config), retain=True)
+        # Discovery: botão abrir portão
+        button_config = {
+            "name": "Portão Motorline Abrir",
+            "command_topic": MQTT_TOPIC_COMMAND,
+            "payload_press": "OPEN",
+            "unique_id": "motorline_portao_abrir",
+            "device": device,
+        }
+        c.publish(f"{MQTT_DISCOVERY_PREFIX}/button/motorline_portao_abrir/config", json.dumps(button_config), retain=True)
+        c.subscribe(MQTT_TOPIC_COMMAND)
+
+    def on_message(c, userdata, msg):
+        opts = load_options()
+        device_id = (opts.get("device_id") or "").strip()
+        if not device_id:
+            return
+        set_device_value(device_id, 2)  # 2 = abrir
+        _mqtt_publish_state(c)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+    try:
+        client.connect(host, port, 60)
+    except Exception as e:
+        logger.warning("MQTT connect falhou: %s", e)
+        return
+    client.loop_start()
+    time.sleep(2)
+    logger.info("MQTT discovery publicado; sensor e botão devem aparecer no Home Assistant.")
+    while True:
+        time.sleep(30)
+        try:
+            _mqtt_publish_state(client)
+        except Exception as e:
+            logger.debug("MQTT publish state: %s", e)
 
 
 def _post_device_value(device_id: str, num: int, token: str, body: dict | None = None) -> tuple[bool, int, str]:
@@ -966,4 +1079,6 @@ if __name__ == "__main__":
     logger.info("A iniciar servidor na porta %s", port)
     t = threading.Thread(target=_background_tasks, daemon=True)
     t.start()
+    t_mqtt = threading.Thread(target=_mqtt_thread, daemon=True)
+    t_mqtt.start()
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
