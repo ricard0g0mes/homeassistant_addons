@@ -115,7 +115,7 @@ class TestMotorlineFlow(unittest.TestCase):
 
         mock_post.return_value = MagicMock(status_code=200, text="")
         ok, status, err = main._post_device_value(
-            "66755146c8a511e8645bd710", 2, "any_token", "Jwt"
+            "66755146c8a511e8645bd710", 2, "any_token"
         )
         self.assertTrue(ok)
         self.assertEqual(status, 200)
@@ -126,12 +126,11 @@ class TestMotorlineFlow(unittest.TestCase):
         self.assertEqual(call_args[1]["json"].get("value"), 2)
 
     @patch("main.requests.post")
-    def test_set_device_value_success_with_user_token(self, mock_post):
+    @patch("main.ensure_token")
+    def test_set_device_value_success_with_user_token(self, mock_ensure, mock_post):
         import main
 
-        main._user_token = "user_tok"
-        main._user_token_expires_at = time.time() + 3600
-        main._token = None
+        mock_ensure.return_value = ("home_tok", "")
         mock_post.return_value = MagicMock(status_code=200, text="")
         ok, err = main.set_device_value("66755146c8a511e8645bd710", 2)
         self.assertTrue(ok)
