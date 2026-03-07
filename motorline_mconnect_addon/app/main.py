@@ -471,23 +471,29 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     ok, status, err = _post_device_value(device_id, num, token)
     if ok:
         return True, ""
+    if status == 401:
+        global _token_expired_alert
+        _token_expired_alert = True
     if status != 401:
         return False, f"HTTP {status}: {err}"
-    return False, "401 — token expirado. Clique em 'Pedir código por email' no painel."
+    return False, "401 — token expirado. Use o botão «Pedir novo código por email» abaixo."
 
 
 @app.route("/api/ui-state", methods=["GET"])
 def api_ui_state():
-    """Estado para o painel: status, has_credentials, token_expired_alert, device_id, gate_state (posição do portão)."""
+    """Estado para o painel: status, has_credentials, token_expired_alert, device_id, email, token_preview, gate_state."""
     opts = load_options()
     device_id = (opts.get("device_id") or "").strip()
     status_res = login_status().get_json()
     has_credentials = bool((opts.get("email") or "").strip() and opts.get("password"))
+    token_str = (opts.get("token") or "").strip()
     out = {
         "status": status_res["status"],
         "message": status_res["message"],
         "token_expired_alert": status_res.get("token_expired_alert", False),
         "device_id": device_id or None,
+        "email": (opts.get("email") or "").strip() or None,
+        "token_preview": (token_str[:32] + "…") if len(token_str) > 32 else (token_str or None),
         "has_credentials": has_credentials,
     }
     if device_id:
@@ -498,6 +504,22 @@ def api_ui_state():
                 out["gate_state"] = gate.get("value", 0)
                 out["gate_state_unit"] = gate.get("unit", "%")
     return jsonify(out)
+
+
+@app.route("/api/token", methods=["POST"])
+def api_set_token():
+    """Guarda o token de autenticação. Body: {\"token\": \"...\", \"expires_in\": 3600} (expires_in opcional)."""
+    global _token, _token_expires_at
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"ok": False, "error": "token em falta"}), 400
+    expires_in = int(data.get("expires_in", 3600))
+    expires_at = time.time() + expires_in
+    save_state({"token": token, "token_expires_at": expires_at})
+    _token = token
+    _token_expires_at = expires_at
+    return jsonify({"ok": True, "message": "Token guardado"})
 
 
 @app.route("/api/gate-state", methods=["GET"])
@@ -562,6 +584,12 @@ def _panel_html() -> str:
 <body>
   <h1>Motorline MConnect</h1>
   <div id="panel" class="card">A carregar...</div>
+  <div id="configCard" class="card" style="margin-top:1rem;">
+    <p><strong>Configuração</strong></p>
+    <p><label>Device ID:</label><br><input type="text" id="configDeviceId" placeholder="ID do dispositivo" style="margin-bottom:0.25rem;"><br><button type="button" id="btnSaveDeviceId" style="background:#6c757d;">Guardar device_id</button></p>
+    <p><label>Email:</label><br><span id="configEmail" style="display:inline-block;margin:0.25rem 0;"></span></p>
+    <p><label>Token (autenticação):</label><br><span id="configTokenPreview" style="display:inline-block;margin:0.25rem 0;word-break:break-all;font-size:0.85rem;"></span><br><input type="password" id="configTokenNew" placeholder="Colar novo token e guardar" style="margin-top:0.25rem;"><br><button type="button" id="btnSaveToken" style="background:#6c757d;margin-top:0.25rem;">Guardar token</button></p>
+  </div>
   <div id="msg"></div>
   <script>
     function el(id) { return document.getElementById(id); }
@@ -573,8 +601,36 @@ def _panel_html() -> str:
     function setPanel(html) { el('panel').innerHTML = html; }
     function setPanelClass(c) { el('panel').className = 'card ' + (c || ''); }
 
+    function setConfigCard(d) {
+      el('configDeviceId').value = (d.device_id || '');
+      el('configEmail').textContent = (d.email || '(não configurado)');
+      el('configTokenPreview').textContent = (d.token_preview || '(nenhum)');
+      if (!window.configCardInited) {
+        window.configCardInited = true;
+        el('btnSaveDeviceId').onclick = saveConfigDeviceId;
+        el('btnSaveToken').onclick = saveConfigToken;
+      }
+    }
+    function saveConfigDeviceId() {
+      var id = (el('configDeviceId').value || '').trim();
+      if (!id) { showMsg('Introduza o device_id.', true); return; }
+      showMsg('A guardar...');
+      fetch('/api/device_id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_id: id }) })
+        .then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Device ID guardado.' : (res.error || 'Erro'), !res.ok); if (res.ok) poll(); })
+        .catch(function() { showMsg('Erro de rede.', true); });
+    }
+    function saveConfigToken() {
+      var tok = (el('configTokenNew').value || '').trim();
+      if (!tok) { showMsg('Introduza o token.', true); return; }
+      showMsg('A guardar...');
+      fetch('/api/token', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: tok, expires_in: 3600 }) })
+        .then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Token guardado.' : (res.error || 'Erro'), !res.ok); if (res.ok) { el('configTokenNew').value = ''; poll(); } })
+        .catch(function() { showMsg('Erro de rede.', true); });
+    }
+
     function poll() {
       fetch('/api/ui-state').then(r => r.json()).then(function(d) {
+        setConfigCard(d);
         if (d.status === 'ready') {
           if (!d.device_id && el('deviceIdInput')) return;
           setPanelClass('success');
@@ -583,6 +639,8 @@ def _panel_html() -> str:
             html += '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>';
             if (d.gate_state !== undefined) html += '<p>Posição do portão: <strong>' + d.gate_state + (d.gate_state_unit || '%') + '</strong></p>';
             html += '<p><button type="button" id="btnTrigger">Disparar portão</button></p>';
+            if (d.token_expired_alert) html += '<p class="alert" style="margin:0.5rem 0 0 0; padding:0.5rem;">Sessão expirada. Use o botão abaixo para receber um novo código por email.</p>';
+            html += '<p style="margin-top:0.5rem;"><button type="button" id="btnRenew" style="background:#6c757d;">Pedir novo código por email</button></p>';
           } else {
             html += '<p class="alert" style="margin:0 0 0.75rem 0; padding:0.5rem;">ID do dispositivo não foi obtido. Introduza-o abaixo (ex: 66755146c8a511e8645bd710). Pode encontrá-lo na app Motorline ou no URL do dispositivo.</p>';
             html += '<input type="text" id="deviceIdInput" placeholder="ID do dispositivo (device_id)" style="margin-bottom:0.5rem;">';
@@ -590,6 +648,7 @@ def _panel_html() -> str:
           }
           setPanel(html);
           if (el('btnTrigger')) el('btnTrigger').onclick = triggerGate;
+          if (el('btnRenew')) el('btnRenew').onclick = requestCode;
           if (el('btnSaveDevice')) { el('btnSaveDevice').onclick = saveDeviceId; el('deviceIdInput').onkeydown = function(e) { if (e.key === 'Enter') saveDeviceId(); }; }
           return;
         }
