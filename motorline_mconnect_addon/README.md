@@ -33,29 +33,16 @@ maintainer: Teu Nome
 2. Copia para dentro dela: `config.yaml`, `build.yaml`, `Dockerfile`, `run.sh` e a pasta `app/` (com `main.py`, `requirements.txt` e, se quiseres, `options.json` como exemplo).
 3. No Supervisor, o addon deve aparecer como addon local; instala e configura.
 
-## Configuração do addon
+## Utilização (sem configuração no HA)
 
-No HA, em **Definições** → **Add-ons** → **Motorline MConnect** → **Configuração**:
+1. **Instala** o addon e **inicia-o**. Não é necessário preencher nenhuma opção nas definições do addon.
+2. Abre o **painel web**: **Add-ons** → **Motorline MConnect** → **Abrir painel web** (ou `http://<addon>:8765/`).
+3. No **primeiro arranque** o painel pede **email** e **password** da conta Motorline MConnect. Introduz e clica em **Iniciar sessão**.
+4. Se a API enviar um **código por email**, o painel mostra o campo para o código. Introduz o código recebido e clica em **Submeter código**.
+5. O **device_id** é obtido automaticamente (um dispositivo) ou guardado o primeiro da lista. Ficas **Operacional**.
+6. **Quando a sessão expirar** (verificação a cada hora): o painel mostra aviso e volta a pedir o código; introduz o novo código no mesmo painel.
 
-| Opção | Descrição |
-|--------|-----------|
-| `api_base_url` | URL base da API (default: `https://api.mconnect.motorline.pt`) |
-| `email` | Email da conta MConnect |
-| `password` | Password da conta |
-| `device_id` | (Opcional) ID do dispositivo/portão. Se vazio, é obtido automaticamente após o primeiro login (quando há um único dispositivo). |
-| `refresh_before_expiry_seconds` | Renovar token N segundos antes de expirar (default: 300). 0 = só renovar ao receber 401 |
-
-Reinicia o addon após guardar.
-
-## Painel web e código por email
-
-1. **Após instalar**: Em **Definições** → **Add-ons** → **Motorline MConnect** define **email** e **password**, guarda e inicia o addon.
-2. Abre o **painel do addon**: `http://<addon>:8765/` (no HA: **Add-ons** → **Motorline MConnect** → **Abrir painel web** ou usa o URL do addon na porta 8765).
-3. O addon inicia o login automaticamente. Se a API enviar um **código por email**, o painel mostra a mensagem e um campo para introduzir o código. Introduz o código e clica em **Submeter código**.
-4. Se não tiveres `device_id` configurado, o addon obtém-o automaticamente (um dispositivo) ou guarda o primeiro da lista.
-5. **Quando a sessão expirar** (verificação a cada hora): o painel mostra um aviso a amarelo e volta a pedir o código. Recebes novo email da Motorline; introduz o código no mesmo painel.
-
-Alternativa por API: **POST** `http://<addon>:8765/login/verify` com body `{"code": "123456"}`. Estado: **GET** `http://<host>:8765/login/status` → `"awaiting_code"` | `"ready"` | `"not_logged_in"`.
+Tudo (credenciais, device_id) fica guardado em `/data/` dentro do addon. A URL da API e o intervalo de renovação são internos.
 
 ## Endpoints do addon (porta 8765)
 

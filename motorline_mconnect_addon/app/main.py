@@ -22,17 +22,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuração (HA injecta em /data/options.json)
-OPTIONS_PATH = Path("/data/options.json")
-if not OPTIONS_PATH.exists():
-    OPTIONS_PATH = Path(__file__).parent / "options.json"
-
-# Estado persistente (device_id; addon não pode escrever options.json)
+# Tudo em estado persistente (sem configuração no HA). API URL e refresh são internos.
 DATA_DIR = Path("/data")
 STATE_PATH = DATA_DIR / "motorline_state.json"
 if not DATA_DIR.exists():
     DATA_DIR = Path(__file__).parent
     STATE_PATH = DATA_DIR / "motorline_state.json"
+
+API_BASE_URL = "https://api.mconnect.motorline.pt"
+REFRESH_BEFORE_EXPIRY_SECONDS = 300
 
 app = Flask(__name__)
 
@@ -50,12 +48,15 @@ _lock = threading.Lock()
 
 
 def load_options():
-    with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
-        opts = json.load(f)
+    """Configuração vem do state (email, password, device_id). API URL e refresh são constantes."""
     state = load_state()
-    if state.get("device_id"):
-        opts = {**opts, "device_id": state["device_id"]}
-    return opts
+    return {
+        "api_base_url": API_BASE_URL,
+        "refresh_before_expiry_seconds": REFRESH_BEFORE_EXPIRY_SECONDS,
+        "email": (state.get("email") or "").strip(),
+        "password": state.get("password") or "",
+        "device_id": (state.get("device_id") or "").strip(),
+    }
 
 
 def load_state() -> dict:
@@ -138,7 +139,6 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
     return None, 0
 
 
-<<<<<<< Updated upstream
 def verify_code(code: str) -> tuple[str | None, int]:
     """
     Completa o login MFA com o código recebido por email.
@@ -206,35 +206,27 @@ def get_devices(token: str) -> list[dict]:
     return []
 
 
-def ensure_token() -> str | None:
-    """Obtém um token válido (renovando se necessário). Se estiver à espera de código, retorna None."""
-=======
 def ensure_token() -> tuple[str | None, str]:
     """Obtém um token válido (renovando se necessário). Retorna (token, mensagem_erro)."""
->>>>>>> Stashed changes
     global _token, _token_expires_at
     if _awaiting_code:
-        return None
+        return None, "À espera do código por email"
     opts = load_options()
-    refresh_before = int(opts.get("refresh_before_expiry_seconds", 300))
+    refresh_before = int(opts.get("refresh_before_expiry_seconds", REFRESH_BEFORE_EXPIRY_SECONDS))
     now = time.time()
 
     if _token and _token_expires_at > now + refresh_before:
         return _token, ""
 
-    api_base_url = opts.get("api_base_url", "https://api.mconnect.motorline.pt")
+    api_base_url = opts.get("api_base_url", API_BASE_URL)
     email = opts.get("email", "")
     password = opts.get("password", "")
     if not email or not password:
-        error_msg = "email ou password em falta nas opções"
-        logger.error(error_msg)
-        return None, error_msg
+        return None, "Introduza email e password no painel"
 
     token, expires_in = login(api_base_url, email, password)
     if not token:
-        error_msg = "Login falhou - verifica email/password e endpoint da API. Consulta os logs para detalhes."
-        logger.error(error_msg)
-        return None, error_msg
+        return None, "Login falhou (verifica credenciais ou consulta os logs)"
 
     _token = token
     _token_expires_at = now + expires_in
@@ -251,7 +243,7 @@ def _background_tasks():
     while True:
         time.sleep(3600)
         with _lock:
-            t = ensure_token()
+            t, _ = ensure_token()
             if t is None and _awaiting_code:
                 _token_expired_alert = True
                 logger.warning("Token expirado ou inválido. É necessário novo código por email.")
@@ -270,13 +262,7 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     for attempt in range(2):
         token, error_msg = ensure_token()
         if not token:
-<<<<<<< Updated upstream
-            if _awaiting_code:
-                return False, "À espera do código por email. Submeta em POST /login/verify com {\"code\": \"...\"}"
-            return False, "Falha ao obter token"
-=======
             return False, error_msg or "Falha ao obter token"
->>>>>>> Stashed changes
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -305,24 +291,26 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
 
 @app.route("/api/ui-state", methods=["GET"])
 def api_ui_state():
-    """Estado para o painel: status, awaiting_code, token_expired_alert, device_id."""
+    """Estado para o painel: status, has_credentials, token_expired_alert, device_id."""
     opts = load_options()
     device_id = (opts.get("device_id") or "").strip()
     status_res = login_status().get_json()
+    has_credentials = bool((opts.get("email") or "").strip() and opts.get("password"))
     return jsonify({
         "status": status_res["status"],
         "message": status_res["message"],
         "token_expired_alert": status_res.get("token_expired_alert", False),
         "device_id": device_id or None,
+        "has_credentials": has_credentials,
     })
 
 
 @app.route("/api/devices", methods=["GET"])
 def api_devices():
     """Lista dispositivos (requer token)."""
-    token = ensure_token()
+    token, err = ensure_token()
     if not token:
-        return jsonify({"ok": False, "error": "Não autenticado"}), 401
+        return jsonify({"ok": False, "error": err or "Não autenticado"}), 401
     devices = get_devices(token)
     return jsonify({"ok": True, "devices": devices})
 
@@ -391,19 +379,42 @@ def _panel_html() -> str:
             '<input type="text" id="code" placeholder="Código (ex: 123456)" maxlength="8" autocomplete="one-time-code">' +
             '<button type="button" id="btnVerify">Submeter código</button>');
           el('btnVerify').onclick = submitCode;
-          el('code').onkeydown = function(e) { if (e.key === 'Enter') submitCode(); };
+          if (el('code')) el('code').onkeydown = function(e) { if (e.key === 'Enter') submitCode(); };
+          return;
+        }
+        if (!d.has_credentials) {
+          setPanelClass('');
+          setPanel('<p><strong>Primeiro uso:</strong> introduza o email e a password da sua conta Motorline MConnect.</p>' +
+            '<input type="email" id="email" placeholder="Email" autocomplete="email">' +
+            '<input type="password" id="password" placeholder="Password" autocomplete="current-password">' +
+            '<button type="button" id="btnLogin">Iniciar sessão</button>');
+          el('btnLogin').onclick = submitLogin;
+          if (el('email')) el('email').onkeydown = function(e) { if (e.key === 'Enter') el('password') && el('password').focus(); };
+          if (el('password')) el('password').onkeydown = function(e) { if (e.key === 'Enter') submitLogin(); };
           return;
         }
         setPanelClass('');
         setPanel('<p>' + (d.message || 'Não autenticado') + '</p>' +
-          '<p>Configure <strong>email</strong> e <strong>password</strong> nas opções do addon no Home Assistant e reinicie. Depois clique abaixo para iniciar o login.</p>' +
-          '<button type="button" id="btnStart">Iniciar sessão</button>');
+          '<button type="button" id="btnStart">Tentar novamente</button>');
         el('btnStart').onclick = startLogin;
       }).catch(function() { setPanel('<p>Erro a obter estado. A recarregar...</p>'); });
     }
+    function submitLogin() {
+      var email = (el('email') && el('email').value || '').trim();
+      var password = el('password') && el('password').value || '';
+      if (!email) { showMsg('Introduza o email.', true); return; }
+      if (!password) { showMsg('Introduza a password.', true); return; }
+      showMsg('A iniciar sessão...');
+      fetch('/login/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email, password: password })
+      }).then(function() { showMsg(''); poll(); }).catch(function() { showMsg('Erro de rede.', true); });
+    }
     function startLogin() {
-      el('btnStart').disabled = true;
-      fetch('/login/start', { method: 'POST' }).then(function() { poll(); }).finally(function() { el('btnStart').disabled = false; });
+      var btn = el('btnStart');
+      if (btn) btn.disabled = true;
+      fetch('/login/start', { method: 'POST' }).then(function() { poll(); }).finally(function() { if (btn) btn.disabled = false; });
     }
     function submitCode() {
       var code = (el('code') && el('code').value || '').trim();
@@ -454,11 +465,15 @@ def login_status():
 
 @app.route("/login/start", methods=["POST"])
 def login_start():
-    """Inicia o fluxo de login (usa email/password das opções). Útil para o painel acordar o login."""
+    """Inicia o fluxo de login. Body opcional: {"email": "...", "password": "..."} para guardar e fazer login."""
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    if email and password:
+        save_state({"email": email, "password": password})
     with _lock:
         ensure_token()
-    st = login_status()
-    return st
+    return login_status()
 
 
 @app.route("/login/verify", methods=["POST"])
@@ -545,52 +560,6 @@ def device_value():
     return jsonify({"ok": False, "error": err}), 502
 
 
-<<<<<<< Updated upstream
-=======
-@app.route("/test-login", methods=["GET", "POST"])
-def test_login():
-    """Endpoint de teste para verificar o login manualmente."""
-    opts = load_options()
-    api_base_url = opts.get("api_base_url", "https://api.mconnect.motorline.pt")
-    email = opts.get("email", "")
-    password = opts.get("password", "")
-    
-    if not email or not password:
-        return jsonify({
-            "ok": False, 
-            "error": "email ou password não configurados",
-            "config": {
-                "api_base_url": api_base_url,
-                "email_set": bool(email),
-                "password_set": bool(password)
-            }
-        }), 400
-    
-    logger.info("Teste de login iniciado para %s em %s", email, api_base_url)
-    token, expires_in = login(api_base_url, email, password)
-    
-    if token:
-        return jsonify({
-            "ok": True,
-            "token": token[:20] + "..." if len(token) > 20 else token,
-            "expires_in": expires_in,
-            "message": "Login bem-sucedido"
-        })
-    
-    return jsonify({
-        "ok": False, 
-        "error": "Login falhou - verifica email/password e endpoint da API",
-        "tried_endpoints": [
-            f"{api_base_url}/auth/login",
-            f"{api_base_url}/login",
-            f"{api_base_url}/api/auth/login",
-            f"{api_base_url}/api/login"
-        ],
-        "hint": "Consulta os logs do addon para ver detalhes das tentativas"
-    }), 401
-
-
->>>>>>> Stashed changes
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8765))
     logger.info("A iniciar servidor na porta %s", port)
