@@ -29,7 +29,9 @@ if not DATA_DIR.exists():
     DATA_DIR = Path(__file__).parent
     STATE_PATH = DATA_DIR / "motorline_state.json"
 
-API_BASE_URL = "https://api.mconnect.motorline.pt"
+# Auth: rest.mconnect.pt (HAR). Comando do portão: api.mconnect.motorline.pt (testado pelo utilizador).
+API_BASE_URL = "https://rest.mconnect.pt"
+DEVICES_API_BASE_URL = "https://api.mconnect.motorline.pt"
 REFRESH_BEFORE_EXPIRY_SECONDS = 300
 
 app = Flask(__name__)
@@ -220,11 +222,63 @@ def verify_code(code: str) -> tuple[str | None, int]:
     return None, 0
 
 
+def exchange_user_token_for_home_token(user_token: str) -> tuple[str | None, int, str | None]:
+    """
+    Na API rest.mconnect.pt: o token de /user/mfa/verify é de utilizador.
+    Para comandar dispositivos é preciso o token da "casa": GET /homes → POST /homes/auth/token.
+    Retorna (home_access_token, expires_in, home_id) ou (None, 0, None).
+    """
+    base = API_BASE_URL.rstrip("/")
+    headers = {"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}
+    try:
+        r = requests.get(f"{base}/homes", headers=headers, timeout=15)
+        if r.status_code != 200:
+            logger.warning("GET /homes: status=%s %s", r.status_code, r.text[:200])
+            return None, 0, None
+        homes = r.json() if r.text else []
+        if not isinstance(homes, list) or not homes:
+            logger.warning("GET /homes: sem casas")
+            return None, 0, None
+        home_id = homes[0].get("_id") or homes[0].get("id") or ""
+        if not home_id:
+            return None, 0, None
+        r2 = requests.post(
+            f"{base}/homes/auth/token",
+            json={"grant_type": "authorization", "code": user_token, "home_id": home_id},
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+        data = r2.json() if r2.text else {}
+        token = data.get("access_token") or data.get("token") or data.get("accessToken")
+        if r2.status_code != 200 or not token:
+            logger.warning("POST /homes/auth/token: status=%s body=%s", r2.status_code, data)
+            return None, 0, None
+        expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
+        logger.info("Token da casa obtido (home_id=%s, expira em %s s)", home_id[:12], expires_in)
+        return token, expires_in, home_id
+    except Exception as e:
+        logger.warning("exchange_user_token_for_home_token: %s", e)
+        return None, 0, None
+
+
 def get_devices(token: str) -> list[dict]:
-    """Lista dispositivos da API (portões). Tenta GET /devices e GET /user/devices."""
-    opts = load_options()
-    base = opts.get("api_base_url", "https://api.mconnect.motorline.pt").rstrip("/")
+    """Lista dispositivos. Na rest.mconnect.pt vêm em GET /rooms (cada room tem devices)."""
+    base = API_BASE_URL.rstrip("/")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        r = requests.get(f"{base}/rooms", headers=headers, timeout=15)
+        if r.status_code == 200 and r.text:
+            raw = r.json()
+            rooms = raw if isinstance(raw, list) else []
+            out = []
+            for room in rooms:
+                for d in room.get("devices", []):
+                    if isinstance(d, dict):
+                        out.append({"id": d.get("_id", d.get("id", d.get("device_id", ""))), "name": d.get("name", d.get("label", ""))})
+            if out:
+                return out
+    except Exception as e:
+        logger.debug("get_devices /rooms: %s", e)
     for path in ("/devices", "/user/devices"):
         try:
             r = requests.get(f"{base}{path}", headers=headers, timeout=15)
@@ -233,13 +287,7 @@ def get_devices(token: str) -> list[dict]:
             data = r.json() if r.text else {}
             items = data if isinstance(data, list) else data.get("devices", data.get("data", []))
             if isinstance(items, list) and items:
-                out = []
-                for d in items:
-                    if isinstance(d, dict):
-                        out.append({"id": d.get("id", d.get("device_id", d.get("_id", ""))), "name": d.get("name", d.get("label", ""))})
-                    else:
-                        out.append({"id": str(d), "name": ""})
-                return out
+                return [{"id": d.get("id", d.get("device_id", d.get("_id", ""))) if isinstance(d, dict) else str(d), "name": d.get("name", d.get("label", "")) if isinstance(d, dict) else ""} for d in items]
         except Exception as e:
             logger.debug("get_devices %s: %s", path, e)
     return []
@@ -292,13 +340,14 @@ def _background_tasks():
 
 def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, str]:
     """
-    Define o valor do dispositivo (portão) na API Motorline.
-    Em caso de 401, renova o token e tenta uma vez.
+    Define o valor do dispositivo (portão). Endpoint em api.mconnect.motorline.pt.
+    Header: Authorization "Jwt <token>", body: {"value_id": "gate_state", "value": 2} (2 = abrir).
     """
     global _token, _token_expires_at
-    opts = load_options()
-    base = opts.get("api_base_url", "https://api.mconnect.motorline.pt").rstrip("/")
+    base = DEVICES_API_BASE_URL.rstrip("/")
     url = f"{base}/devices/value/{device_id}"
+    # value 2 = abrir (confirmado pelo utilizador); 1 ou outro mantém compatibilidade
+    num = 2 if value in (1, "1", "open") else int(value) if isinstance(value, (int, float)) else 2
 
     for attempt in range(2):
         token, error_msg = ensure_token()
@@ -306,14 +355,14 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
             return False, error_msg or "Falha ao obter token"
 
         headers = {
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Jwt {token}",
             "Content-Type": "application/json",
+            "Timezone": "Europe/Lisbon",
         }
         try:
-            # API MConnect exige POST (PUT devolve 405 Method Not Allowed)
             r = requests.post(
                 url,
-                json={"value": value},
+                json={"value_id": "gate_state", "value": num},
                 headers=headers,
                 timeout=15,
             )
@@ -580,22 +629,29 @@ def login_verify():
     if not code:
         return jsonify({"ok": False, "error": "Envie o código no body: {\"code\": \"123456\"}"}), 400
 
-    token, expires_in = verify_code(code)
-    if not token:
+    user_token, expires_in = verify_code(code)
+    if not user_token:
         return jsonify({
             "ok": False,
             "error": "Código inválido ou API não respondeu com token. O código pode ter expirado (vários minutos).",
             "hint": "Clique em 'Tentar novamente', espere o novo email e introduza o código de imediato. Consulte os logs do addon para detalhes da API.",
         }), 400
 
-    _token = token
-    _token_expires_at = time.time() + expires_in
+    home_token, home_expires, home_id = exchange_user_token_for_home_token(user_token)
+    if home_token:
+        _token = home_token
+        _token_expires_at = time.time() + home_expires
+        if home_id:
+            save_state({"home_id": home_id})
+    else:
+        _token = user_token
+        _token_expires_at = time.time() + expires_in
     _token_expired_alert = False
 
     opts = load_options()
     device_id = (opts.get("device_id") or "").strip()
     if not device_id:
-        devices = get_devices(token)
+        devices = get_devices(_token)
         if len(devices) == 1:
             device_id = devices[0].get("id", "")
             if device_id:
