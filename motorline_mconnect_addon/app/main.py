@@ -123,6 +123,14 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
         data = r.json() if r.text else {}
         token = data.get("access_token") or data.get("token") or data.get("accessToken")
         if r.status_code == 200 and token:
+            if data.get("mfa_required") or data.get("requires_verification") or data.get("mfa") is True:
+                _awaiting_code = True
+                _login_session = {"api_base_url": base, "email": email}
+                for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
+                    if data.get(key) is not None:
+                        _login_session[key] = data[key]
+                logger.info("API devolveu token mas ainda exige MFA. Introduza o código do email.")
+                return None, 0
             expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
             logger.info("Login OK (token direto), expira em %s s", expires_in)
             return token, expires_in
@@ -145,16 +153,23 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
 def verify_code(code: str) -> tuple[str | None, int]:
     """
     Completa o login MFA com o código recebido por email.
-    API Motorline: POST /user/mfa/verify (ou /auth/mfa/verify). Envia code, platform, model, uuid e qualquer session_id da resposta do login.
-    Retorna (access_token, expires_in) ou (None, 0).
+    Se não houver sessão MFA ativa (ex.: API devolveu "token direto" que não serve para o portão),
+    usa as credenciais guardadas para tentar na mesma o verify – a API pode aceitar email + código.
     """
     global _awaiting_code, _login_session
 
-    if not _awaiting_code or not _login_session:
-        logger.error("Nenhum login à espera de código. Faça primeiro login (email/password) e espere o email antes de submeter o código.")
+    if not _login_session and _awaiting_code:
+        logger.error("Nenhum login à espera de código. Faça primeiro login (email/password) e espere o email.")
         return None, 0
 
-    base = _login_session["api_base_url"]
+    if not _login_session:
+        opts = load_options()
+        if not opts.get("email") or not opts.get("password"):
+            logger.error("Sem credenciais guardadas. Introduza email e password no painel primeiro.")
+            return None, 0
+        _login_session = {"api_base_url": opts.get("api_base_url", API_BASE_URL), "email": opts.get("email", "")}
+
+    base = _login_session.get("api_base_url", API_BASE_URL).rstrip("/")
     code_clean = code.strip().replace(" ", "")
     payload = {
         "code": code_clean,
@@ -163,6 +178,8 @@ def verify_code(code: str) -> tuple[str | None, int]:
         "model": "addon",
         "uuid": MFA_DEVICE_UUID,
     }
+    if _login_session.get("email"):
+        payload["email"] = _login_session["email"]
     for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
         if _login_session.get(key) is not None:
             payload[key] = _login_session[key]
@@ -229,7 +246,7 @@ def get_devices(token: str) -> list[dict]:
 
 
 def ensure_token() -> tuple[str | None, str]:
-    """Obtém um token válido (renovando se necessário). Retorna (token, mensagem_erro)."""
+    """Obtém um token válido (renovando se necessário). Retorna (token, mensagem_erro). Só uma chamada a login() por vez (lock)."""
     global _token, _token_expires_at
     if _awaiting_code:
         return None, "À espera do código por email"
@@ -240,35 +257,37 @@ def ensure_token() -> tuple[str | None, str]:
     if _token and _token_expires_at > now + refresh_before:
         return _token, ""
 
-    api_base_url = opts.get("api_base_url", API_BASE_URL)
     email = opts.get("email", "")
     password = opts.get("password", "")
     if not email or not password:
         return None, "Introduza email e password no painel"
 
-    token, expires_in = login(api_base_url, email, password)
-    if not token:
-        return None, "Login falhou (verifica credenciais ou consulta os logs)"
-
-    _token = token
-    _token_expires_at = now + expires_in
-    return _token, ""
+    with _lock:
+        if _awaiting_code:
+            return None, "À espera do código por email"
+        if _token and _token_expires_at > now + refresh_before:
+            return _token, ""
+        api_base_url = opts.get("api_base_url", API_BASE_URL)
+        token, expires_in = login(api_base_url, email, password)
+        if not token:
+            return None, "Login falhou (verifica credenciais ou consulta os logs)"
+        _token = token
+        _token_expires_at = now + expires_in
+        return _token, ""
 
 
 def _background_tasks():
     """Ao arranque: tenta login. A cada hora: verifica token e, se expirado, alerta para novo código."""
     global _token_expired_alert
     time.sleep(2)
-    with _lock:
-        ensure_token()
+    ensure_token()
     logger.info("Verificação de token em background ativa (intervalo: 1 h)")
     while True:
         time.sleep(3600)
-        with _lock:
-            t, _ = ensure_token()
-            if t is None and _awaiting_code:
-                _token_expired_alert = True
-                logger.warning("Token expirado ou inválido. É necessário novo código por email.")
+        t, _ = ensure_token()
+        if t is None and _awaiting_code:
+            _token_expired_alert = True
+            logger.warning("Token expirado ou inválido. É necessário novo código por email.")
 
 
 def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, str]:
@@ -541,8 +560,7 @@ def login_start():
     password = data.get("password") or ""
     if email and password:
         save_state({"email": email, "password": password})
-    with _lock:
-        ensure_token()
+    ensure_token()
     return login_status()
 
 
