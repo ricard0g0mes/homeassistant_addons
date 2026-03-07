@@ -383,6 +383,7 @@ def _panel_html() -> str:
           return;
         }
         if (!d.has_credentials) {
+          if (el('email') && el('password')) return;
           setPanelClass('');
           setPanel('<p><strong>Primeiro uso:</strong> introduza o email e a password da sua conta Motorline MConnect.</p>' +
             '<input type="email" id="email" placeholder="Email" autocomplete="email">' +
