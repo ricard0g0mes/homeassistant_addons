@@ -142,9 +142,19 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
                         _login_session[key] = data[key]
                 logger.info("API devolveu token mas ainda exige MFA. Introduza o código do email.")
                 return None, 0
+            # Token "direto" é muitas vezes MFA token (API dispositivos rejeita com "The token is a MFA token")
+            home_token, home_expires, _ = exchange_user_token_for_home_token(token)
+            if home_token:
+                logger.info("Login OK (token da casa), expira em %s s", home_expires)
+                return home_token, home_expires
             expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
-            logger.info("Login OK (token direto), expira em %s s", expires_in)
-            return token, expires_in
+            logger.info("Token do login é MFA token; a API do portão exige código. Introduza o código do email.")
+            _awaiting_code = True
+            _login_session = {"api_base_url": base, "email": email}
+            for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
+                if data.get(key) is not None:
+                    _login_session[key] = data[key]
+            return None, 0
         if r.status_code == 401 or _is_mfa_required_response(r.status_code, data):
             _awaiting_code = True
             _login_session = {"api_base_url": base, "email": email}
@@ -326,55 +336,30 @@ def _release_login_file_lock(fd):
         pass
 
 def ensure_token() -> tuple[str | None, str]:
-    """Obtém um token válido (renovando se necessário). Só uma chamada a login() por vez (lock em ficheiro)."""
-    global _token, _token_expires_at
+    """Retorna o token se válido. Nunca chama login() — o código só é pedido quando o utilizador clica em 'Pedir código por email' no painel."""
     if _awaiting_code:
         return None, "À espera do código por email"
     opts = load_options()
     refresh_before = int(opts.get("refresh_before_expiry_seconds", REFRESH_BEFORE_EXPIRY_SECONDS))
     now = time.time()
-
     if _token and _token_expires_at > now + refresh_before:
         return _token, ""
-
-    email = opts.get("email", "")
-    password = opts.get("password", "")
-    if not email or not password:
+    if not (opts.get("email") or "").strip() or not opts.get("password"):
         return None, "Introduza email e password no painel"
-
-    fd = _acquire_login_file_lock()
-    if fd is None:
-        return None, "Login já em curso (aguarde o email)"
-    try:
-        with _lock:
-            if _awaiting_code:
-                return None, "À espera do código por email"
-            if _token and _token_expires_at > now + refresh_before:
-                return _token, ""
-        api_base_url = opts.get("api_base_url", API_BASE_URL)
-        token, expires_in = login(api_base_url, email, password)
-        with _lock:
-            if token:
-                _token = token
-                _token_expires_at = time.time() + expires_in
-                return _token, ""
-        return None, "Login falhou (verifica credenciais ou consulta os logs)"
-    finally:
-        _release_login_file_lock(fd)
+    return None, "Abra o painel e clique em 'Pedir código por email' para obter um novo código."
 
 
 def _background_tasks():
-    """Ao arranque: tenta login. A cada hora: verifica token e, se expirado, alerta para novo código."""
+    """A cada hora: verifica se o token expirou e ativa o alerta no painel. Nunca envia email (só o utilizador com o botão)."""
     global _token_expired_alert
     time.sleep(2)
-    ensure_token()
-    logger.info("Verificação de token em background ativa (intervalo: 1 h)")
+    logger.info("Verificação de token em background ativa (intervalo: 1 h); o código só é pedido ao clicar no botão no painel.")
     while True:
         time.sleep(3600)
-        t, _ = ensure_token()
-        if t is None and _awaiting_code:
+        now = time.time()
+        if (not _token or _token_expires_at <= now) and not _awaiting_code:
             _token_expired_alert = True
-            logger.warning("Token expirado ou inválido. É necessário novo código por email.")
+            logger.warning("Token expirado. Abra o painel e clique em 'Pedir código por email' para obter um novo código.")
 
 
 def _post_device_value(device_id: str, num: int, token: str, auth_scheme: str = "Jwt") -> tuple[bool, int, str]:
@@ -534,7 +519,7 @@ def _panel_html() -> str:
         if (d.status === 'awaiting_code') {
           if (el('code') && el('btnVerify')) return;
           setPanelClass(d.token_expired_alert ? 'alert' : '');
-          setPanel('<p><strong>Foi enviado um código ao seu email.</strong> Introduza-o abaixo para concluir o login.</p>' +
+          setPanel('<p><strong>Foi enviado um código ao seu email.</strong> Introduza-o abaixo e clique em Submeter código.</p>' +
             '<input type="text" id="code" placeholder="Código (ex: 123456)" maxlength="8" autocomplete="one-time-code">' +
             '<button type="button" id="btnVerify">Submeter código</button>');
           el('btnVerify').onclick = submitCode;
@@ -556,13 +541,13 @@ def _panel_html() -> str:
         if (el('code') && el('btnVerify')) return;
         setPanelClass('');
         setPanel('<p>' + (d.message || 'Não autenticado') + '</p>' +
-          '<p><strong>Se recebeu um código por email</strong>, introduza-o abaixo (o addon está à espera):</p>' +
+          '<p><strong>O código só é enviado quando clicar no botão abaixo.</strong> Depois de receber o email, introduza o código:</p>' +
+          '<p><button type="button" id="btnStart">Pedir código por email</button></p>' +
           '<input type="text" id="code" placeholder="Código (ex: 123456)" maxlength="8" autocomplete="one-time-code">' +
-          '<button type="button" id="btnVerify">Submeter código</button>' +
-          '<p style="margin-top:1rem;"><button type="button" id="btnStart">Tentar novamente (reenviar email)</button></p>');
+          '<button type="button" id="btnVerify">Submeter código</button>');
         el('btnVerify').onclick = submitCode;
         if (el('code')) el('code').onkeydown = function(e) { if (e.key === 'Enter') submitCode(); };
-        el('btnStart').onclick = startLogin;
+        el('btnStart').onclick = requestCode;
       }).catch(function() { setPanel('<p>Erro a obter estado. A recarregar...</p>'); });
     }
     function showCodeForm() {
@@ -589,11 +574,15 @@ def _panel_html() -> str:
         else poll();
       }).catch(function() { showMsg('Erro de rede.', true); });
     }
-    function startLogin() {
+    function requestCode() {
       var btn = el('btnStart');
       if (btn) btn.disabled = true;
-      fetch('/login/start', { method: 'POST' }).then(function() { poll(); }).finally(function() { if (btn) btn.disabled = false; });
+      fetch('/login/start', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(data) {
+        if (data.status === 'awaiting_code') showCodeForm();
+        else poll();
+      }).finally(function() { if (btn) btn.disabled = false; });
     }
+    function startLogin() { requestCode(); }
     function submitCode() {
       var code = (el('code') && el('code').value || '').trim();
       if (!code) { showMsg('Introduza o código.', true); return; }
@@ -663,13 +652,30 @@ def login_status():
 
 @app.route("/login/start", methods=["POST"])
 def login_start():
-    """Inicia o fluxo de login. Body opcional: {"email": "...", "password": "..."} para guardar e fazer login."""
+    """Único ponto que pede código por email: chamado quando o utilizador clica em 'Pedir código por email' no painel."""
+    global _token, _token_expires_at
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
     if email and password:
         save_state({"email": email, "password": password})
-    ensure_token()
+    opts = load_options()
+    email = opts.get("email", "").strip()
+    password = opts.get("password", "")
+    if not email or not password:
+        return jsonify({"status": "not_logged_in", "message": "Introduza email e password no painel", "token_expired_alert": _token_expired_alert}), 200
+    fd = _acquire_login_file_lock()
+    if fd is None:
+        return jsonify({"status": "awaiting_code", "message": "Já foi enviado um email. Introduza o código ou aguarde.", "token_expired_alert": _token_expired_alert}), 200
+    try:
+        api_base_url = opts.get("api_base_url", API_BASE_URL)
+        token, expires_in = login(api_base_url, email, password)
+        with _lock:
+            if token:
+                _token = token
+                _token_expires_at = time.time() + expires_in
+    finally:
+        _release_login_file_lock(fd)
     return login_status()
 
 
