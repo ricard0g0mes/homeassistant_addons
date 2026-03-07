@@ -287,8 +287,9 @@ def exchange_user_token_for_home_token(user_token: str) -> tuple[str | None, int
 def exchange_for_device_token(user_token: str, home_token: str | None, home_id: str | None, device_id: str) -> tuple[str | None, int]:
     """
     Tenta obter um token com device_id no payload (api.mconnect.motorline.pt exige isso).
-    Prova rest.mconnect.pt: POST /devices/auth/token ou /homes/devices/auth/token.
+    Prova rest.mconnect.pt e depois api.mconnect.motorline.pt.
     """
+    # 1) rest.mconnect.pt
     base = API_BASE_URL.rstrip("/")
     for code, label in [(user_token, "user"), (home_token or user_token, "home")]:
         if not code:
@@ -305,6 +306,27 @@ def exchange_for_device_token(user_token: str, home_token: str | None, home_id: 
                 if r.status_code == 200 and tok:
                     exp = int(data.get("expires_in", data.get("expiresIn", 3600)))
                     logger.info("Token por dispositivo obtido em %s (exp %s s)", path, exp)
+                    return tok, exp
+            except Exception as e:
+                logger.debug("exchange_for_device_token %s: %s", path, e)
+
+    # 2) api.mconnect.motorline.pt (API do portão pode emitir o seu próprio token)
+    dev_base = DEVICES_API_BASE_URL.rstrip("/")
+    for code in (user_token, home_token):
+        if not code:
+            continue
+        for path, body in [
+            (f"{dev_base}/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id}),
+            (f"{dev_base}/devices/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id}),
+            (f"{dev_base}/auth/token", {"grant_type": "authorization", "access_token": code, "device_id": device_id}),
+        ]:
+            try:
+                r = requests.post(path, json=body, headers={"Content-Type": "application/json"}, timeout=10)
+                data = r.json() if r.text else {}
+                tok = data.get("access_token") or data.get("token") or data.get("accessToken")
+                if r.status_code == 200 and tok:
+                    exp = int(data.get("expires_in", data.get("expiresIn", 3600)))
+                    logger.info("Token devices API obtido em %s (exp %s s)", path, exp)
                     return tok, exp
             except Exception as e:
                 logger.debug("exchange_for_device_token %s: %s", path, e)
@@ -404,16 +426,17 @@ def _background_tasks():
             logger.warning("Token expirado. Abra o painel e clique em 'Pedir código por email' para obter um novo código.")
 
 
-def _post_device_value(device_id: str, num: int, token: str, auth_scheme: str = "Jwt") -> tuple[bool, int, str]:
+def _post_device_value(device_id: str, num: int, token: str, auth_scheme: str = "Jwt", body: dict | None = None) -> tuple[bool, int, str]:
     """Faz POST para /devices/value. Retorna (ok, status_code, erro ou '')."""
     base = DEVICES_API_BASE_URL.rstrip("/")
     url = f"{base}/devices/value/{device_id}"
+    payload = body or {"value_id": "gate_state", "value": num}
     headers = {
         "Authorization": f"{auth_scheme} {token}",
         "Content-Type": "application/json",
         "Timezone": "Europe/Lisbon",
     }
-    r = requests.post(url, json={"value_id": "gate_state", "value": num}, headers=headers, timeout=15)
+    r = requests.post(url, json=payload, headers=headers, timeout=15)
     if r.status_code in (200, 204):
         return True, r.status_code, ""
     return False, r.status_code, r.text[:300] if r.text else ""
@@ -426,20 +449,39 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     """
     num = 2 if value in (1, "1", "open") else int(value) if isinstance(value, (int, float)) else 2
 
-    # 1) Token de utilizador primeiro (o JWT que funciona no rest_command costuma ser este)
+    # Variações de body que algumas APIs aceitam
+    bodies = [
+        {"value_id": "gate_state", "value": num},
+        {"value": num},
+        {"value_id": "relay", "value": num},
+    ]
+
+    def try_post(tok: str, scheme: str) -> tuple[bool, int, str]:
+        for b in bodies:
+            ok, status, err = _post_device_value(device_id, num, tok, scheme, b)
+            if ok:
+                return True, status, ""
+            if status != 401:
+                return False, status, err
+        return False, 401, err or ""
+
+    # 1) Token de utilizador primeiro
     if _user_token and _user_token_expires_at > time.time():
-        ok, status, err = _post_device_value(device_id, num, _user_token, "Jwt")
+        ok, status, err = try_post(_user_token, "Jwt")
         if ok:
             return True, ""
         if status != 401:
-            logger.warning("devices/value (user_token): HTTP %s %s", status, err)
+            logger.warning("devices/value (user_token Jwt): HTTP %s %s", status, err)
+        ok, _, _ = try_post(_user_token, "Bearer")
+        if ok:
+            return True, ""
 
     token, error_msg = ensure_token()
     if not token:
         return False, error_msg or "Falha ao obter token"
 
-    # 2) Token principal (casa ou dispositivo) — Jwt
-    ok, status, err = _post_device_value(device_id, num, token, "Jwt")
+    # 2) Token principal (casa ou dispositivo)
+    ok, status, err = try_post(token, "Jwt")
     if ok:
         return True, ""
     if status != 401:
@@ -447,7 +489,7 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
         return False, f"HTTP {status}: {err}"
 
     logger.warning("devices/value 401 (Jwt). Resposta: %s", err)
-    ok, status, _ = _post_device_value(device_id, num, token, "Bearer")
+    ok, _, _ = try_post(token, "Bearer")
     if ok:
         return True, ""
 
