@@ -176,8 +176,33 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     Define o valor do dispositivo (portão) na API Motorline.
     Em caso de 401, renova o token e tenta uma vez.
     """
-    global _token, _token_expires_at
     opts = load_options()
+    # Novo modo: backend REST público, igual ao frontend web (sem autenticação)
+    if opts.get("use_rest_backend"):
+        base = opts.get("rest_base_url", "https://rest.mconnect.pt").rstrip("/")
+        url = f"{base}/devices/value/{device_id}"
+        value_id = opts.get("value_id", "gate_state") or "gate_state"
+        headers = {
+            "Content-Type": "application/json",
+            "Origin": "https://mconnect.motorline.pt",
+            "Timezone": opts.get("timezone", "Europe/Lisbon"),
+            "Accept": "*/*",
+        }
+        try:
+            r = requests.post(
+                url,
+                json={"value_id": value_id, "value": value},
+                headers=headers,
+                timeout=15,
+            )
+            if 200 <= r.status_code < 300:
+                return True, ""
+            return False, f"HTTP {r.status_code}: {r.text[:200]}"
+        except requests.RequestException as e:
+            return False, str(e)
+
+    # Modo antigo: API auth (token + MFA)
+    global _token, _token_expires_at
     base = opts.get("api_base_url", "https://api.mconnect.motorline.pt").rstrip("/")
     url = f"{base}/devices/value/{device_id}"
 
@@ -281,9 +306,12 @@ def trigger():
     if not device_id:
         return jsonify({"ok": False, "error": "device_id não configurado"}), 400
 
-    value = 1
+    # No backend REST (sem auth) o frontend usa value=2 para gate_state.
+    # Mantemos 1 como default no modo antigo para compatibilidade.
+    use_rest = bool(opts.get("use_rest_backend"))
+    value = 2 if use_rest else 1
     if request.is_json and request.json:
-        value = request.json.get("value", 1)
+        value = request.json.get("value", value)
     elif request.args.get("value") is not None:
         try:
             value = int(request.args.get("value"))

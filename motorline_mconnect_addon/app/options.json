@@ -3,5 +3,8 @@
   "email": "",
   "password": "",
   "device_id": "66755146c8a511e8645bd710",
-  "refresh_before_expiry_seconds": 300
+  "refresh_before_expiry_seconds": 300,
+  "rest_base_url": "https://rest.mconnect.pt",
+  "use_rest_backend": false,
+  "value_id": "gate_state"
 }
