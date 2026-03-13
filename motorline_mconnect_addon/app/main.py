@@ -658,6 +658,15 @@ def _mqtt_thread() -> None:
             "device": device,
         }
         c.publish(f"{MQTT_DISCOVERY_PREFIX}/button/motorline_portao_abrir/config", json.dumps(button_config), retain=True)
+        # Discovery: botão fechar portão
+        button_close_config = {
+            "name": "Portão Motorline Fechar",
+            "command_topic": MQTT_TOPIC_COMMAND,
+            "payload_press": "CLOSE",
+            "unique_id": "motorline_portao_fechar",
+            "device": device,
+        }
+        c.publish(f"{MQTT_DISCOVERY_PREFIX}/button/motorline_portao_fechar/config", json.dumps(button_close_config), retain=True)
         c.subscribe(MQTT_TOPIC_COMMAND)
 
     def on_message(c, userdata, msg):
@@ -665,7 +674,13 @@ def _mqtt_thread() -> None:
         device_id = (opts.get("device_id") or "").strip()
         if not device_id:
             return
-        set_device_value(device_id, 2)  # 2 = abrir
+        try:
+            payload = (msg.payload or b"").decode("utf-8").strip().upper()
+        except Exception:
+            payload = "OPEN"
+        # CLOSE, 0, FECHAR → fechar (0); resto → abrir (2)
+        value = 0 if payload in ("CLOSE", "0", "FECHAR") else 2
+        set_device_value(device_id, value)
         _mqtt_publish_state(c)
 
     client.on_connect = on_connect
