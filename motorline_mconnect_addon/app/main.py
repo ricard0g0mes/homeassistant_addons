@@ -43,6 +43,10 @@ API_BASE_URL = "https://rest.mconnect.pt"
 DEVICES_API_BASE_URL = "https://api.mconnect.motorline.pt"
 REFRESH_BEFORE_EXPIRY_SECONDS = 300
 
+# Modo de teste simples: nunca faz login/MFA nem usa Authorization.
+# Replica o padrão observado no HAR (sem auth explícita em /rooms e /devices/value).
+NO_AUTH_MODE = True
+
 app = Flask(__name__)
 
 # Estado do token (em memória; renovado ao receber 401 ou antes do expiry)
@@ -355,19 +359,15 @@ def exchange_for_device_token(user_token: str, home_token: str | None, home_id: 
 def _get_rooms(token: str) -> list[dict]:
     """GET /rooms na rest.mconnect.pt. Cada room tem devices com values (ex.: gate_state)."""
     base = API_BASE_URL.rstrip("/")
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # Em NO_AUTH_MODE chamamos sempre sem Authorization (como no HAR).
+    headers = {"Content-Type": "application/json"}
     try:
         r = requests.get(f"{base}/rooms", headers=headers, timeout=15)
         if r.status_code == 200 and r.text:
             raw = r.json()
             return raw if isinstance(raw, list) else []
-        # Fallback: alguns ambientes aceitam /rooms sem Authorization (como no HAR).
-        if r.status_code == 401:
-            logger.warning("GET /rooms com Authorization devolveu 401; a tentar sem auth (fallback HAR).")
-            r2 = requests.get(f"{base}/rooms", headers={"Content-Type": "application/json"}, timeout=15)
-            if r2.status_code == 200 and r2.text:
-                raw2 = r2.json()
-                return raw2 if isinstance(raw2, list) else []
+        if r.status_code != 200:
+            logger.warning("GET /rooms (no-auth) devolveu %s: %s", r.status_code, r.text[:200] if r.text else "")
     except Exception as e:
         logger.debug("_get_rooms: %s", e)
     return []
@@ -441,7 +441,12 @@ def _release_login_file_lock(fd):
         pass
 
 def ensure_token() -> tuple[str | None, str]:
-    """Retorna o token se válido (memória ou state). Nunca chama login() — o código só é pedido quando o utilizador clica em 'Pedir código por email'."""
+    """Retorna o token se válido (memória ou state).
+
+    Em NO_AUTH_MODE devolve sempre um token "dummy" e não faz login nem validações.
+    """
+    if NO_AUTH_MODE:
+        return "noauth", ""
     global _token, _token_expires_at, _user_token, _user_token_expires_at
     if _awaiting_code:
         return None, "À espera do código por email"
@@ -468,6 +473,9 @@ def ensure_token() -> tuple[str | None, str]:
 def _background_tasks():
     """A cada hora: verifica se o token expirou e ativa o alerta no painel. Nunca envia email (só o utilizador com o botão)."""
     global _token_expired_alert
+    if NO_AUTH_MODE:
+        logger.info("NO_AUTH_MODE ativo: verificação de token desativada.")
+        return
     time.sleep(2)
     logger.info("Verificação de token em background ativa (intervalo: 1 h); o código só é pedido ao clicar no botão no painel.")
     while True:
@@ -580,11 +588,13 @@ def _post_device_value(device_id: str, num: int, token: str, body: dict | None =
     base = API_BASE_URL.rstrip("/")
     url = f"{base}/devices/value/{device_id}"
     payload = body or {"value_id": "gate_state", "value": num}
+    # Em NO_AUTH_MODE não enviamos Authorization (igual ao HAR).
     headers = {
-        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "timezone": "Europe/Lisbon",
     }
+    if not NO_AUTH_MODE:
+        headers["Authorization"] = f"Bearer {token}"
     r = requests.post(url, json=payload, headers=headers, timeout=15)
     if r.status_code in (200, 204):
         return True, r.status_code, ""
@@ -606,32 +616,10 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     if ok:
         return True, ""
 
-    # Se o token for rejeitado (401), alguns ambientes aceitam o comando sem Authorization,
-    # tal como observado no HAR. Tentamos esse fallback uma vez antes de assumir erro.
-    if status == 401:
-        logger.warning("devices/value com Authorization devolveu 401: %s", err)
-        try:
-            base = API_BASE_URL.rstrip("/")
-            url = f"{base}/devices/value/{device_id}"
-            r2 = requests.post(
-                url,
-                json={"value_id": "gate_state", "value": num},
-                headers={"Content-Type": "application/json", "timezone": "Europe/Lisbon"},
-                timeout=15,
-            )
-            if r2.status_code in (200, 204):
-                logger.info("devices/value aceitou comando sem Authorization (fallback HAR).")
-                return True, ""
-            status = r2.status_code
-            err = r2.text[:300] if r2.text else err
-            logger.warning("devices/value sem Authorization devolveu %s: %s", status, err)
-        except requests.RequestException as e:
-            err = str(e)
-
-        if status == 401:
-            global _token_expired_alert
-            _token_expired_alert = True
-            return False, "401 — token expirado. Tenta novamente pedir código por email ou verificar o login."
+    if status == 401 and not NO_AUTH_MODE:
+        global _token_expired_alert
+        _token_expired_alert = True
+        return False, "401 — token expirado. Tenta novamente pedir código por email ou verificar o login."
 
     return False, f"HTTP {status}: {err}"
 
@@ -941,6 +929,8 @@ def health():
 def login_status():
     """Indica se o add-on está à espera do código de verificação por email."""
     global _awaiting_code, _token, _token_expired_alert
+    if NO_AUTH_MODE:
+        return jsonify({"status": "ready", "message": "Sessão ativa (modo sem autenticação)", "token_expired_alert": False})
     if _awaiting_code:
         return jsonify({
             "status": "awaiting_code",
@@ -956,6 +946,9 @@ def login_status():
 def login_start():
     """Único ponto que pede código por email: chamado quando o utilizador clica em 'Pedir código por email' no painel."""
     global _token, _token_expires_at
+    if NO_AUTH_MODE:
+        # Em modo sem auth ignoramos credenciais e marcamos logo como "ready".
+        return jsonify({"status": "ready", "message": "Sessão ativa (modo sem autenticação)", "token_expired_alert": False}), 200
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip()
     password = data.get("password") or ""
@@ -989,6 +982,8 @@ def login_verify():
     Se não houver device_id configurado, obtém a lista de dispositivos e guarda o primeiro.
     """
     global _token, _token_expires_at, _token_expired_alert, _user_token, _user_token_expires_at
+    if NO_AUTH_MODE:
+        return jsonify({"ok": True, "message": "Modo sem autenticação: não é necessário código."})
     code = None
     if request.is_json and request.json:
         code = (request.json.get("code") or request.json.get("otp") or "").strip()
