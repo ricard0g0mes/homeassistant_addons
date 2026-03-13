@@ -43,9 +43,8 @@ API_BASE_URL = "https://rest.mconnect.pt"
 DEVICES_API_BASE_URL = "https://api.mconnect.motorline.pt"
 REFRESH_BEFORE_EXPIRY_SECONDS = 300
 
-# Modo de teste simples: nunca faz login/MFA nem usa Authorization.
-# Replica o padrão observado no HAR (sem auth explícita em /rooms e /devices/value).
-NO_AUTH_MODE = True
+# Modo de teste: False = usar login + código por email e token da casa (recomendado).
+NO_AUTH_MODE = False
 
 app = Flask(__name__)
 
@@ -67,6 +66,82 @@ _LOGIN_LOCK_PATH = DATA_DIR / ".motorline_login.lock"
 
 # Opções do addon (HA injeta em /data/options.json)
 ADDON_OPTIONS_PATH = DATA_DIR / "options.json"
+
+# Sessão HTTP com cookies persistentes (igual à página Motorline no browser)
+COOKIES_PATH = DATA_DIR / "motorline_cookies.json"
+_session: requests.Session | None = None
+_session_lock = threading.Lock()
+
+
+def get_http_session() -> requests.Session:
+    """Sessão única; cookies carregados de disco e enviados em todos os pedidos (como no browser)."""
+    global _session
+    with _session_lock:
+        if _session is None:
+            _session = requests.Session()
+            _session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+                "Accept-Language": "pt,en-US;q=0.9,en;q=0.8",
+                "Origin": "https://mconnect.motorline.pt",
+                "Content-Type": "application/json",
+            })
+            _load_session_cookies()
+        return _session
+
+
+def _load_session_cookies():
+    """Carrega cookies guardados em disco para a sessão (sobrevive a reinícios do addon)."""
+    if not COOKIES_PATH.exists():
+        return
+    try:
+        with open(COOKIES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for c in data if isinstance(data, list) else []:
+            if isinstance(c, dict) and c.get("name") and c.get("value") is not None:
+                _session.cookies.set(
+                    c["name"],
+                    c["value"],
+                    domain=c.get("domain") or "",
+                    path=c.get("path") or "/",
+                    expires=c.get("expires"),
+                )
+        logger.info("Cookies de sessão carregados (%s)", len(data) if isinstance(data, list) else 0)
+    except Exception as e:
+        logger.debug("load_session_cookies: %s", e)
+
+
+def _save_session_cookies():
+    """Guarda cookies da sessão em disco (igual à persistência no browser)."""
+    if _session is None:
+        return
+    try:
+        out = []
+        for c in _session.cookies:
+            out.append({
+                "name": c.name,
+                "value": c.value,
+                "domain": getattr(c, "domain", "") or "",
+                "path": getattr(c, "path", "") or "/",
+                "expires": getattr(c, "expires", None),
+            })
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=0)
+    except Exception as e:
+        logger.debug("save_session_cookies: %s", e)
+
+
+def _open_motorline_page() -> None:
+    """Abre a página da Motorline (GET) para obter os mesmos cookies que o browser recebe."""
+    try:
+        s = get_http_session()
+        r = s.get("https://mconnect.motorline.pt/", timeout=15)
+        if r.status_code == 200 and r.cookies:
+            _save_session_cookies()
+            logger.info("Página Motorline carregada; cookies recebidos e guardados.")
+    except Exception as e:
+        logger.debug("_open_motorline_page: %s", e)
 
 
 def load_addon_options() -> dict:
@@ -155,15 +230,17 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
         "mfa": True,
     }
     headers = {"Content-Type": "application/json"}
-
+    session = get_http_session()
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=15)
+        r = session.post(url, json=body, headers=headers, timeout=15)
+        if r.cookies:
+            _save_session_cookies()
         data = r.json() if r.text else {}
         token = data.get("access_token") or data.get("token") or data.get("accessToken")
         if r.status_code == 200 and token:
             if data.get("mfa_required") or data.get("requires_verification") or data.get("mfa") is True:
                 _awaiting_code = True
-                _login_session = {"api_base_url": base, "email": email}
+                _login_session = {"api_base_url": base, "email": email, "access_token": token}
                 for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
                     if data.get(key) is not None:
                         _login_session[key] = data[key]
@@ -177,7 +254,7 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
             expires_in = int(data.get("expires_in", data.get("expiresIn", 3600)))
             logger.info("Token do login é MFA token; a API do portão exige código. Introduza o código do email.")
             _awaiting_code = True
-            _login_session = {"api_base_url": base, "email": email}
+            _login_session = {"api_base_url": base, "email": email, "access_token": token}
             for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
                 if data.get(key) is not None:
                     _login_session[key] = data[key]
@@ -185,6 +262,8 @@ def login(api_base_url: str, email: str, password: str) -> tuple[str | None, int
         if r.status_code == 401 or _is_mfa_required_response(r.status_code, data):
             _awaiting_code = True
             _login_session = {"api_base_url": base, "email": email}
+            if token:
+                _login_session["access_token"] = token
             for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
                 if data.get(key) is not None:
                     _login_session[key] = data[key]
@@ -232,9 +311,15 @@ def verify_code(code: str) -> tuple[str | None, int]:
         if _login_session.get(key) is not None:
             payload[key] = _login_session[key]
 
-    def try_verify(url: str, body: dict) -> tuple[str | None, int]:
+    session = get_http_session()
+
+    def try_verify(url: str, body: dict, headers: dict | None = None) -> tuple[str | None, int]:
+        if headers is None:
+            headers = {"Content-Type": "application/json"}
         try:
-            r = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
+            r = session.post(url, json=body, headers=headers, timeout=15)
+            if r.cookies:
+                _save_session_cookies()
             data = r.json() if r.text else {}
             token = data.get("access_token") or data.get("token") or data.get("accessToken")
             if r.status_code == 200 and token:
@@ -245,8 +330,12 @@ def verify_code(code: str) -> tuple[str | None, int]:
             logger.debug("MFA verify %s: %s", url, e)
         return None, 0
 
+    # /user/mfa/verify exige Authorization: Bearer <token do primeiro login>
+    mfa_headers = {"Content-Type": "application/json"}
+    if _login_session.get("access_token"):
+        mfa_headers["Authorization"] = f"Bearer {_login_session['access_token']}"
     for url in (f"{base}/user/mfa/verify", f"{base}/auth/mfa/verify", f"{base}/mfa/verify"):
-        token, exp = try_verify(url, payload)
+        token, exp = try_verify(url, payload, mfa_headers)
         if token:
             _awaiting_code = False
             _login_session = None
@@ -276,8 +365,11 @@ def exchange_user_token_for_home_token(user_token: str) -> tuple[str | None, int
     """
     base = API_BASE_URL.rstrip("/")
     headers = {"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}
+    session = get_http_session()
     try:
-        r = requests.get(f"{base}/homes", headers=headers, timeout=15)
+        r = session.get(f"{base}/homes", headers=headers, timeout=15)
+        if r.cookies:
+            _save_session_cookies()
         if r.status_code != 200:
             logger.warning("GET /homes: status=%s %s", r.status_code, r.text[:200])
             return None, 0, None
@@ -288,12 +380,14 @@ def exchange_user_token_for_home_token(user_token: str) -> tuple[str | None, int
         home_id = homes[0].get("_id") or homes[0].get("id") or ""
         if not home_id:
             return None, 0, None
-        r2 = requests.post(
+        r2 = session.post(
             f"{base}/homes/auth/token",
             json={"grant_type": "authorization", "code": user_token, "home_id": home_id},
             headers={"Content-Type": "application/json"},
             timeout=15,
         )
+        if r2.cookies:
+            _save_session_cookies()
         data = r2.json() if r2.text else {}
         token = data.get("access_token") or data.get("token") or data.get("accessToken")
         if r2.status_code != 200 or not token:
@@ -317,13 +411,14 @@ def exchange_for_device_token(user_token: str, home_token: str | None, home_id: 
     for code, label in [(user_token, "user"), (home_token or user_token, "home")]:
         if not code:
             continue
+        session = get_http_session()
         for path, body in [
             (f"{base}/devices/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id}),
             (f"{base}/devices/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id, "home_id": home_id or ""}),
             (f"{base}/homes/devices/auth/token", {"grant_type": "authorization", "code": code, "device_id": device_id, "home_id": home_id or ""}),
         ]:
             try:
-                r = requests.post(path, json=body, headers={"Content-Type": "application/json"}, timeout=10)
+                r = session.post(path, json=body, headers={"Content-Type": "application/json"}, timeout=10)
                 data = r.json() if r.text else {}
                 tok = data.get("access_token") or data.get("token") or data.get("accessToken")
                 if r.status_code == 200 and tok:
@@ -344,7 +439,7 @@ def exchange_for_device_token(user_token: str, home_token: str | None, home_id: 
             (f"{dev_base}/auth/token", {"grant_type": "authorization", "access_token": code, "device_id": device_id}),
         ]:
             try:
-                r = requests.post(path, json=body, headers={"Content-Type": "application/json"}, timeout=10)
+                r = session.post(path, json=body, headers={"Content-Type": "application/json"}, timeout=10)
                 data = r.json() if r.text else {}
                 tok = data.get("access_token") or data.get("token") or data.get("accessToken")
                 if r.status_code == 200 and tok:
@@ -357,17 +452,21 @@ def exchange_for_device_token(user_token: str, home_token: str | None, home_id: 
 
 
 def _get_rooms(token: str) -> list[dict]:
-    """GET /rooms na rest.mconnect.pt. Cada room tem devices com values (ex.: gate_state)."""
+    """GET /rooms na rest.mconnect.pt. Usa sessão com cookies (como o browser) e opcionalmente Bearer."""
     base = API_BASE_URL.rstrip("/")
-    # Em NO_AUTH_MODE chamamos sempre sem Authorization (como no HAR).
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "timezone": "Europe/Lisbon"}
+    if not NO_AUTH_MODE and token:
+        headers["Authorization"] = f"Bearer {token}"
+    session = get_http_session()
     try:
-        r = requests.get(f"{base}/rooms", headers=headers, timeout=15)
+        r = session.get(f"{base}/rooms", headers=headers, timeout=15)
+        if r.cookies:
+            _save_session_cookies()
         if r.status_code == 200 and r.text:
             raw = r.json()
             return raw if isinstance(raw, list) else []
         if r.status_code != 200:
-            logger.warning("GET /rooms (no-auth) devolveu %s: %s", r.status_code, r.text[:200] if r.text else "")
+            logger.warning("GET /rooms devolveu %s: %s", r.status_code, r.text[:200] if r.text else "")
     except Exception as e:
         logger.debug("_get_rooms: %s", e)
     return []
@@ -588,16 +687,24 @@ def _post_device_value(device_id: str, num: int, token: str, body: dict | None =
     base = API_BASE_URL.rstrip("/")
     url = f"{base}/devices/value/{device_id}"
     payload = body or {"value_id": "gate_state", "value": num}
-    # Em NO_AUTH_MODE não enviamos Authorization (igual ao HAR).
+    # Em NO_AUTH_MODE não enviamos Authorization; replicar headers do HAR.
     headers = {
         "Content-Type": "application/json",
+        "Origin": "https://mconnect.motorline.pt",
         "timezone": "Europe/Lisbon",
+        "Accept": "*/*",
     }
     if not NO_AUTH_MODE:
         headers["Authorization"] = f"Bearer {token}"
-    r = requests.post(url, json=payload, headers=headers, timeout=15)
+    logger.info("POST %s (no_auth=%s) body=%s", url, NO_AUTH_MODE, payload)
+    session = get_http_session()
+    r = session.post(url, json=payload, headers=headers, timeout=15)
+    if r.cookies:
+        _save_session_cookies()
     if r.status_code in (200, 204):
+        logger.info("devices/value OK status=%s", r.status_code)
         return True, r.status_code, ""
+    logger.warning("devices/value falhou status=%s body=%s", r.status_code, r.text[:300] if r.text else "")
     return False, r.status_code, r.text[:300] if r.text else ""
 
 
@@ -966,6 +1073,7 @@ def login_start():
     if fd is None:
         return jsonify({"status": "awaiting_code", "message": "Já foi enviado um email. Introduza o código ou aguarde.", "token_expired_alert": _token_expired_alert}), 200
     try:
+        _open_motorline_page()  # Cookies iguais ao browser ao abrir a página
         api_base_url = opts.get("api_base_url", API_BASE_URL)
         token, expires_in = login(api_base_url, email, password)
         with _lock:
@@ -1093,7 +1201,7 @@ def device_value():
 
 
 if __name__ == "__main__":
-    # Carregar tokens persistidos para sobreviver a reinícios
+    get_http_session()  # Carrega cookies guardados (sessão como no browser)
     opts = load_options()
     now = time.time()
     if opts.get("token") and (opts.get("token_expires_at") or 0) > now:
