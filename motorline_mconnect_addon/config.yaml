@@ -14,9 +14,6 @@ ports:
 ports_description:
   8765/tcp: API local para comandos do portão
 options:
-  api_base_url:
-    default: "https://api.mconnect.motorline.pt"
-    description: URL base da API Motorline
   email:
     description: Email da conta MConnect
     example: "user@example.com"
@@ -27,24 +24,7 @@ options:
     description: ID do dispositivo (portão) - ex. 66755146c8a511e8645bd710
     example: "66755146c8a511e8645bd710"
     required: true
-  refresh_before_expiry_seconds:
-    default: 300
-    description: Renovar token N segundos antes de expirar (0 = só ao receber 401)
-  rest_base_url:
-    default: "https://rest.mconnect.pt"
-    description: URL base REST público (sem login) usado pelo frontend web
-  use_rest_backend:
-    default: false
-    description: Se true, usar rest_base_url e comando sem autenticação (value_id gate_state)
-  value_id:
-    default: "gate_state"
-    description: value_id a usar no backend REST (normalmente gate_state)
 schema:
-  api_base_url: str
   email: str
   password: str
   device_id: str
-  refresh_before_expiry_seconds: int
-  rest_base_url: str
-  use_rest_backend: bool
-  value_id: str

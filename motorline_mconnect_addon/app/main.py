@@ -36,6 +36,12 @@ _token_expires_at = 0.0
 _awaiting_code = False
 _login_session = None  # {"api_base_url", "email", "session_id" ou "request_id" (se a API devolver)}
 
+# Configuração interna para backend REST "frontend-like" (sem autenticação)
+REST_BASE_URL_DEFAULT = "https://rest.mconnect.pt"
+VALUE_ID_DEFAULT = "gate_state"
+USE_REST_BACKEND_DEFAULT = True  # usar sempre o backend REST por omissão
+TIMEZONE_DEFAULT = "Europe/Lisbon"
+
 
 def load_options():
     with open(OPTIONS_PATH, "r", encoding="utf-8") as f:
@@ -178,14 +184,19 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     """
     opts = load_options()
     # Novo modo: backend REST público, igual ao frontend web (sem autenticação)
-    if opts.get("use_rest_backend"):
-        base = opts.get("rest_base_url", "https://rest.mconnect.pt").rstrip("/")
+    use_rest = opts.get("use_rest_backend", USE_REST_BACKEND_DEFAULT)
+    # Aceita também strings "true"/"false" se alguém definir via env/opções manualmente
+    if isinstance(use_rest, str):
+        use_rest = use_rest.strip().lower() in ("1", "true", "yes", "on")
+
+    if use_rest:
+        base = (opts.get("rest_base_url") or REST_BASE_URL_DEFAULT).rstrip("/")
         url = f"{base}/devices/value/{device_id}"
-        value_id = opts.get("value_id", "gate_state") or "gate_state"
+        value_id = opts.get("value_id") or VALUE_ID_DEFAULT
         headers = {
             "Content-Type": "application/json",
             "Origin": "https://mconnect.motorline.pt",
-            "Timezone": opts.get("timezone", "Europe/Lisbon"),
+            "Timezone": opts.get("timezone", TIMEZONE_DEFAULT),
             "Accept": "*/*",
         }
         try:
@@ -308,7 +319,9 @@ def trigger():
 
     # No backend REST (sem auth) o frontend usa value=2 para gate_state.
     # Mantemos 1 como default no modo antigo para compatibilidade.
-    use_rest = bool(opts.get("use_rest_backend"))
+    use_rest = opts.get("use_rest_backend", USE_REST_BACKEND_DEFAULT)
+    if isinstance(use_rest, str):
+        use_rest = use_rest.strip().lower() in ("1", "true", "yes", "on")
     value = 2 if use_rest else 1
     if request.is_json and request.json:
         value = request.json.get("value", value)
