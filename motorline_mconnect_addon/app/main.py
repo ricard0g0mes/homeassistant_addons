@@ -609,6 +609,7 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     # Se o token for rejeitado (401), alguns ambientes aceitam o comando sem Authorization,
     # tal como observado no HAR. Tentamos esse fallback uma vez antes de assumir erro.
     if status == 401:
+        logger.warning("devices/value com Authorization devolveu 401: %s", err)
         try:
             base = API_BASE_URL.rstrip("/")
             url = f"{base}/devices/value/{device_id}"
@@ -623,6 +624,7 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
                 return True, ""
             status = r2.status_code
             err = r2.text[:300] if r2.text else err
+            logger.warning("devices/value sem Authorization devolveu %s: %s", status, err)
         except requests.RequestException as e:
             err = str(e)
 
