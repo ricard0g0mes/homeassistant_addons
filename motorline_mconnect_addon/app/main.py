@@ -573,11 +573,74 @@ def ensure_token() -> tuple[str | None, str]:
         # Mantemos o expires_at apenas como informação (não bloqueia o uso do token)
         _token_expires_at = persisted_exp or _token_expires_at or 0.0
         return _token, ""
+    # Se não temos token mas ainda existe user_token válido, tentar obter automaticamente novo token da casa
+    if (_user_token and (_user_token_expires_at or 0) > now) or (
+        (opts.get("user_token") or "").strip() and (opts.get("user_token_expires_at") or 0) > now
+    ):
+        if _refresh_token_from_user_token():
+            return _token, ""
     # Se não há nenhum token guardado, precisamos pelo menos de credenciais
     if not (opts.get("email") or "").strip() or not opts.get("password"):
         return None, "Introduza email e password no painel"
     # Sem token e com credenciais → é necessário um novo código por email
     return None, "Abra o painel e clique em 'Pedir código por email' para obter um novo código."
+
+
+def _refresh_token_from_user_token() -> bool:
+    """
+    Tenta obter automaticamente um novo token da casa / dispositivo a partir do user_token (MFA já verificado),
+    sem voltar a pedir código por email.
+    """
+    global _token, _token_expires_at, _user_token, _user_token_expires_at
+    opts = load_options()
+    now = time.time()
+    # Hidratar user_token se só existir persistido
+    if not _user_token:
+        ut = (opts.get("user_token") or "").strip()
+        if ut and (opts.get("user_token_expires_at") or 0) > now:
+            _user_token = ut
+            _user_token_expires_at = float(opts.get("user_token_expires_at") or 0)
+    if not _user_token or (_user_token_expires_at or 0) <= now:
+        return False
+
+    # 1) Tentar obter novo token da casa a partir do user_token
+    home_token, home_expires, home_id = exchange_user_token_for_home_token(_user_token)
+    device_id = (opts.get("device_id") or "").strip()
+    if home_token:
+        _token = home_token
+        _token_expires_at = time.time() + home_expires
+        state: dict[str, object] = {
+            "token": _token,
+            "token_expires_at": _token_expires_at,
+            "user_token": _user_token,
+            "user_token_expires_at": _user_token_expires_at,
+        }
+        if home_id:
+            state["home_id"] = home_id
+        save_state(state)
+        logger.info("Token da casa renovado automaticamente a partir do user_token.")
+        return True
+
+    # 2) Se não houver token da casa, tentar token específico do dispositivo (fallback que já existia no login_verify)
+    home_id = (opts.get("home_id") or "") or None
+    if device_id:
+        device_token, device_exp = exchange_for_device_token(_user_token, home_token, home_id or "", device_id)
+        if device_token:
+            _token = device_token
+            _token_expires_at = time.time() + device_exp
+            save_state(
+                {
+                    "token": _token,
+                    "token_expires_at": _token_expires_at,
+                    "user_token": _user_token,
+                    "user_token_expires_at": _user_token_expires_at,
+                }
+            )
+            logger.info("Token do dispositivo renovado automaticamente a partir do user_token.")
+            return True
+
+    logger.warning("Falha ao renovar token a partir do user_token; poderá ser necessário novo código por email.")
+    return False
 
 
 def _background_tasks():
@@ -751,6 +814,15 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
 
     if status == 401 and not NO_AUTH_MODE:
         global _token_expired_alert
+        # Tentar automaticamente obter um novo token a partir do user_token (sem novo login/código)
+        if _refresh_token_from_user_token():
+            new_token, _ = ensure_token()
+            if new_token:
+                ok2, status2, err2 = _post_device_value(device_id, num, new_token)
+                if ok2:
+                    _token_expired_alert = False
+                    return True, ""
+                status, err = status2, err2
         _token_expired_alert = True
         return False, "401 — token expirado. Tenta novamente pedir código por email ou verificar o login."
 
