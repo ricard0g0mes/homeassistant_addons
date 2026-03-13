@@ -636,6 +636,7 @@ def api_ui_state():
         "status": status_res["status"],
         "message": status_res["message"],
         "token_expired_alert": status_res.get("token_expired_alert", False),
+        "no_auth_mode": NO_AUTH_MODE,
         "device_id": device_id or None,
         "email": (opts.get("email") or "").strip() or None,
         "token_preview": (token_str[:32] + "…") if len(token_str) > 32 else (token_str or None),
@@ -793,8 +794,10 @@ def _panel_html() -> str:
             html += '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>';
             if (d.gate_state_state !== undefined) html += '<p>Estado do portão: <strong>' + (d.gate_state_state === 'fechado' ? 'Fechado' : d.gate_state_state === 'aberto' ? 'Aberto' : d.gate_state_state === 'fechando' ? 'Fechando' : d.gate_state_state === 'abrindo' ? 'Abrindo' : d.gate_state_state) + '</strong></p>';
             html += '<p><button type="button" id="btnTrigger">Disparar portão</button></p>';
-            if (d.token_expired_alert) html += '<p class="alert" style="margin:0.5rem 0 0 0; padding:0.5rem;">Sessão expirada. Use o botão abaixo para receber um novo código por email.</p>';
-            html += '<p style="margin-top:0.5rem;"><button type="button" id="btnRenew" style="background:#6c757d;">Pedir novo código por email</button></p>';
+            if (d.token_expired_alert && !d.no_auth_mode) {
+              html += '<p class="alert" style="margin:0.5rem 0 0 0; padding:0.5rem;">Sessão expirada. Use o botão abaixo para receber um novo código por email.</p>';
+              html += '<p style="margin-top:0.5rem;"><button type="button" id="btnRenew" style="background:#6c757d;">Pedir novo código por email</button></p>';
+            }
           } else {
             html += '<p class="alert" style="margin:0 0 0.75rem 0; padding:0.5rem;">ID do dispositivo não foi obtido. Introduza-o abaixo (ex: 66755146c8a511e8645bd710). Pode encontrá-lo na app Motorline ou no URL do dispositivo.</p>';
             html += '<input type="text" id="deviceIdInput" placeholder="ID do dispositivo (device_id)" style="margin-bottom:0.5rem;">';
