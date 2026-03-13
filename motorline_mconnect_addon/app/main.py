@@ -557,22 +557,26 @@ def ensure_token() -> tuple[str | None, str]:
     if _awaiting_code:
         return None, "À espera do código por email"
     opts = load_options()
-    refresh_before = int(opts.get("refresh_before_expiry_seconds", REFRESH_BEFORE_EXPIRY_SECONDS))
     now = time.time()
-    # Hidratar user_token do state se em memória estiver vazio
+    # Hidratar user_token do state se em memória estiver vazio e ainda dentro da validade conhecida
     if not _user_token and opts.get("user_token") and (opts.get("user_token_expires_at") or 0) > now:
         _user_token = opts["user_token"]
         _user_token_expires_at = float(opts["user_token_expires_at"])
-    if _token and _token_expires_at > now + refresh_before:
+    # Se já temos um token em memória, usamos sempre até a API devolver 401
+    if _token:
         return _token, ""
-    # Hidratar a partir do state (ex.: após reinício do addon)
-    persisted = opts.get("token")
+    # Após reinício do addon: tentar sempre reutilizar qualquer token persistido, mesmo que o expires_at seja antigo/0.
+    persisted = (opts.get("token") or "").strip()
     persisted_exp = float(opts.get("token_expires_at") or 0)
-    if persisted and persisted_exp > now + refresh_before:
-        _token, _token_expires_at = persisted, persisted_exp
+    if persisted:
+        _token = persisted
+        # Mantemos o expires_at apenas como informação (não bloqueia o uso do token)
+        _token_expires_at = persisted_exp or _token_expires_at or 0.0
         return _token, ""
+    # Se não há nenhum token guardado, precisamos pelo menos de credenciais
     if not (opts.get("email") or "").strip() or not opts.get("password"):
         return None, "Introduza email e password no painel"
+    # Sem token e com credenciais → é necessário um novo código por email
     return None, "Abra o painel e clique em 'Pedir código por email' para obter um novo código."
 
 
