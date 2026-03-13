@@ -361,6 +361,13 @@ def _get_rooms(token: str) -> list[dict]:
         if r.status_code == 200 and r.text:
             raw = r.json()
             return raw if isinstance(raw, list) else []
+        # Fallback: alguns ambientes aceitam /rooms sem Authorization (como no HAR).
+        if r.status_code == 401:
+            logger.warning("GET /rooms com Authorization devolveu 401; a tentar sem auth (fallback HAR).")
+            r2 = requests.get(f"{base}/rooms", headers={"Content-Type": "application/json"}, timeout=15)
+            if r2.status_code == 200 and r2.text:
+                raw2 = r2.json()
+                return raw2 if isinstance(raw2, list) else []
     except Exception as e:
         logger.debug("_get_rooms: %s", e)
     return []
@@ -598,12 +605,33 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     ok, status, err = _post_device_value(device_id, num, token)
     if ok:
         return True, ""
+
+    # Se o token for rejeitado (401), alguns ambientes aceitam o comando sem Authorization,
+    # tal como observado no HAR. Tentamos esse fallback uma vez antes de assumir erro.
     if status == 401:
-        global _token_expired_alert
-        _token_expired_alert = True
-    if status != 401:
-        return False, f"HTTP {status}: {err}"
-    return False, "401 — token expirado. Use o botão «Pedir novo código por email» abaixo."
+        try:
+            base = API_BASE_URL.rstrip("/")
+            url = f"{base}/devices/value/{device_id}"
+            r2 = requests.post(
+                url,
+                json={"value_id": "gate_state", "value": num},
+                headers={"Content-Type": "application/json", "timezone": "Europe/Lisbon"},
+                timeout=15,
+            )
+            if r2.status_code in (200, 204):
+                logger.info("devices/value aceitou comando sem Authorization (fallback HAR).")
+                return True, ""
+            status = r2.status_code
+            err = r2.text[:300] if r2.text else err
+        except requests.RequestException as e:
+            err = str(e)
+
+        if status == 401:
+            global _token_expired_alert
+            _token_expired_alert = True
+            return False, "401 — token expirado. Tenta novamente pedir código por email ou verificar o login."
+
+    return False, f"HTTP {status}: {err}"
 
 
 @app.route("/api/ui-state", methods=["GET"])
