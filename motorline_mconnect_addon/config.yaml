@@ -1,6 +1,6 @@
 name: Motorline MConnect
 description: Proxy para API Motorline MConnect com renovação automática de token e suporte a código por email no login (comando do portão).
-version: "1.2.0"
+version: "1.2.1"
 slug: motorline_mconnect
 arch:
   - aarch64
