@@ -298,15 +298,13 @@ def verify_code(code: str) -> tuple[str | None, int]:
 
     base = _login_session.get("api_base_url", API_BASE_URL).rstrip("/")
     code_clean = code.strip().replace(" ", "")
+    # Body igual ao HAR: code, platform, model, uuid (browser não envia email nem otp)
     payload = {
         "code": code_clean,
-        "otp": code_clean,
-        "platform": "HomeAssistant",
+        "platform": "Linux",
         "model": "addon",
         "uuid": MFA_DEVICE_UUID,
     }
-    if _login_session.get("email"):
-        payload["email"] = _login_session["email"]
     for key in ("session_id", "request_id", "mfa_token", "mfa_request_id", "state", "nonce", "session"):
         if _login_session.get(key) is not None:
             payload[key] = _login_session[key]
@@ -364,7 +362,12 @@ def exchange_user_token_for_home_token(user_token: str) -> tuple[str | None, int
     Retorna (home_access_token, expires_in, home_id) ou (None, 0, None).
     """
     base = API_BASE_URL.rstrip("/")
-    headers = {"Authorization": f"Bearer {user_token}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {user_token}",
+        "Content-Type": "application/json",
+        "Origin": "https://mconnect.motorline.pt",
+        "timezone": "Europe/Lisbon",
+    }
     session = get_http_session()
     try:
         r = session.get(f"{base}/homes", headers=headers, timeout=15)
@@ -383,7 +386,11 @@ def exchange_user_token_for_home_token(user_token: str) -> tuple[str | None, int
         r2 = session.post(
             f"{base}/homes/auth/token",
             json={"grant_type": "authorization", "code": user_token, "home_id": home_id},
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://mconnect.motorline.pt",
+                "timezone": "Europe/Lisbon",
+            },
             timeout=15,
         )
         if r2.cookies:
@@ -900,7 +907,7 @@ def _panel_html() -> str:
           if (d.device_id) {
             html += '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>';
             if (d.gate_state_state !== undefined) html += '<p>Estado do portão: <strong>' + (d.gate_state_state === 'fechado' ? 'Fechado' : d.gate_state_state === 'aberto' ? 'Aberto' : d.gate_state_state === 'fechando' ? 'Fechando' : d.gate_state_state === 'abrindo' ? 'Abrindo' : d.gate_state_state) + '</strong></p>';
-            html += '<p><button type="button" id="btnTrigger">Disparar portão</button></p>';
+            html += '<p><button type="button" id="btnTrigger">Abrir portão</button> <button type="button" id="btnClose" style="background:#6c757d;">Fechar portão</button></p>';
             if (d.token_expired_alert && !d.no_auth_mode) {
               html += '<p class="alert" style="margin:0.5rem 0 0 0; padding:0.5rem;">Sessão expirada. Use o botão abaixo para receber um novo código por email.</p>';
               html += '<p style="margin-top:0.5rem;"><button type="button" id="btnRenew" style="background:#6c757d;">Pedir novo código por email</button></p>';
@@ -912,6 +919,7 @@ def _panel_html() -> str:
           }
           setPanel(html);
           if (el('btnTrigger')) el('btnTrigger').onclick = triggerGate;
+          if (el('btnClose')) el('btnClose').onclick = closeGate;
           if (el('btnRenew')) el('btnRenew').onclick = requestCode;
           if (el('btnSaveDevice')) { el('btnSaveDevice').onclick = saveDeviceId; el('deviceIdInput').onkeydown = function(e) { if (e.key === 'Enter') saveDeviceId(); }; }
           return;
@@ -1012,8 +1020,15 @@ def _panel_html() -> str:
     function triggerGate() {
       var btn = el('btnTrigger');
       if (btn) btn.disabled = true;
-      fetch('/trigger', { method: 'POST' }).then(r => r.json()).then(function(res) {
-        showMsg(res.ok ? 'Comando enviado.' : (res.error || 'Erro'), !res.ok);
+      fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":2}' }).then(r => r.json()).then(function(res) {
+        showMsg(res.ok ? 'Comando abrir enviado.' : (res.error || 'Erro'), !res.ok);
+      }).catch(function() { showMsg('Erro de rede.', true); }).finally(function() { if (btn) btn.disabled = false; });
+    }
+    function closeGate() {
+      var btn = el('btnClose');
+      if (btn) btn.disabled = true;
+      fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":0}' }).then(r => r.json()).then(function(res) {
+        showMsg(res.ok ? 'Comando fechar enviado.' : (res.error || 'Erro'), !res.ok);
       }).catch(function() { showMsg('Erro de rede.', true); }).finally(function() { if (btn) btn.disabled = false; });
     }
     poll();
