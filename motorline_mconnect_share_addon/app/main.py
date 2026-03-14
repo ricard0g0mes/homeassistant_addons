@@ -649,10 +649,12 @@ def _panel_html() -> str:
           return;
         }
         setPanelClass('');
+        var savedLink = (el('guestLinkInput') && el('guestLinkInput').value) || '';
         var msg = !d.guest_activated
           ? '<p><strong>Acesso por partilha</strong></p><p>Cole o link que recebeu e clique em Ativar. Acesso imediato ao portão, sem login.</p>'
           : '<p><strong>Acesso por partilha</strong></p><p>Se o acesso falhou ou expirou, cole um novo link e ative novamente.</p>';
         setPanel(msg + '<input type="text" id="guestLinkInput" placeholder="https://mconnect.pt/shareable_link?home_id=...&access_code=..." style="width:100%;margin:0.5rem 0;"><button type="button" id="btnGuestActivate">Ativar link</button>');
+        if (el('guestLinkInput') && savedLink) el('guestLinkInput').value = savedLink;
         el('btnGuestActivate').onclick = activateGuestLink;
         if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateGuestLink(); };
       }).catch(function() { setPanel('<p>Erro a obter estado.</p>'); });
