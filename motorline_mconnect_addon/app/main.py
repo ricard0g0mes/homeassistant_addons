@@ -44,7 +44,7 @@ DEVICES_API_BASE_URL = "https://api.mconnect.motorline.pt"
 REFRESH_BEFORE_EXPIRY_SECONDS = 30000
 
 # Modo de teste: False = usar login + código por email e token da casa (recomendado).
-NO_AUTH_MODE = True
+NO_AUTH_MODE = False
 
 app = Flask(__name__)
 
