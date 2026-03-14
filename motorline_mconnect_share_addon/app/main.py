@@ -396,6 +396,7 @@ def _format_token_expiry(expires_at: float) -> str | None:
 MQTT_TOPIC_STATE = "motorline/share/portao/state"
 MQTT_TOPIC_COMMAND = "motorline/share/portao/command"
 MQTT_DISCOVERY_PREFIX = "homeassistant"
+MQTT_STATE_UPDATE_INTERVAL = 5  # segundos entre cada publicação do estado (sensor)
 
 
 def _mqtt_publish_state(client):
@@ -432,9 +433,9 @@ def _mqtt_thread():
         if reason_code != 0:
             return
         device = {"identifiers": ["motorline_mconnect_share"], "name": "Motorline MConnect Share"}
-        client.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/motorline_share_portao_estado/config", json.dumps({"name": "Portão Motorline Share", "state_topic": MQTT_TOPIC_STATE, "value_template": "{{ value_json.state }}", "unique_id": "motorline_share_portao_estado", "device": device}), retain=True)
-        client.publish(f"{MQTT_DISCOVERY_PREFIX}/button/motorline_share_portao_abrir/config", json.dumps({"name": "Portão Motorline Share Abrir", "command_topic": MQTT_TOPIC_COMMAND, "payload_press": "OPEN", "unique_id": "motorline_share_portao_abrir", "device": device}), retain=True)
-        client.publish(f"{MQTT_DISCOVERY_PREFIX}/button/motorline_share_portao_fechar/config", json.dumps({"name": "Portão Motorline Share Fechar", "command_topic": MQTT_TOPIC_COMMAND, "payload_press": "CLOSE", "unique_id": "motorline_share_portao_fechar", "device": device}), retain=True)
+        client.publish(f"{MQTT_DISCOVERY_PREFIX}/sensor/motorline_mconnect_share_estado/config", json.dumps({"name": "Estado", "state_topic": MQTT_TOPIC_STATE, "value_template": "{{ value_json.state }}", "unique_id": "motorline_mconnect_share_estado", "device": device}), retain=True)
+        client.publish(f"{MQTT_DISCOVERY_PREFIX}/button/motorline_mconnect_share_abrir/config", json.dumps({"name": "Abrir", "command_topic": MQTT_TOPIC_COMMAND, "payload_press": "OPEN", "unique_id": "motorline_mconnect_share_abrir", "device": device}), retain=True)
+        client.publish(f"{MQTT_DISCOVERY_PREFIX}/button/motorline_mconnect_share_fechar/config", json.dumps({"name": "Fechar", "command_topic": MQTT_TOPIC_COMMAND, "payload_press": "CLOSE", "unique_id": "motorline_mconnect_share_fechar", "device": device}), retain=True)
         client.subscribe(MQTT_TOPIC_COMMAND)
 
     def on_message(c, userdata, msg):
@@ -460,7 +461,7 @@ def _mqtt_thread():
     client.loop_start()
     time.sleep(2)
     while True:
-        time.sleep(30)
+        time.sleep(MQTT_STATE_UPDATE_INTERVAL)
         try:
             _mqtt_publish_state(client)
         except Exception as e:

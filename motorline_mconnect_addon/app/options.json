@@ -1,7 +1,0 @@
-{
-  "api_base_url": "https://api.mconnect.motorline.pt",
-  "email": "",
-  "password": "",
-  "device_id": "66755146c8a511e8645bd710",
-  "refresh_before_expiry_seconds": 30000
-}
