@@ -644,19 +644,14 @@ def _refresh_token_from_user_token() -> bool:
 
 
 def _background_tasks():
-    """A cada hora: verifica se o token expirou e ativa o alerta no painel. Nunca envia email (só o utilizador com o botão)."""
-    global _token_expired_alert
+    """Thread em background (reservada para tarefas periódicas). O token só é considerado expirado quando um pedido de abrir/fechar devolve 401."""
     if NO_AUTH_MODE:
         logger.info("NO_AUTH_MODE ativo: verificação de token desativada.")
         return
     time.sleep(2)
-    logger.info("Verificação de token em background ativa (intervalo: 1 h); o código só é pedido ao clicar no botão no painel.")
+    logger.info("Alerta de token expirado só é ativado quando um comando de abrir/fechar portão devolver 401.")
     while True:
         time.sleep(3600)
-        now = time.time()
-        if (not _token or _token_expires_at <= now) and not _awaiting_code:
-            _token_expired_alert = True
-            logger.warning("Token expirado. Abra o painel e clique em 'Pedir código por email' para obter um novo código.")
 
 
 # Tópicos MQTT para o HA descobrir sensor e botão
@@ -1154,8 +1149,8 @@ def login_status():
             "token_expired_alert": _token_expired_alert,
         })
     if _token:
-        return jsonify({"status": "ready", "message": "Sessão ativa", "token_expired_alert": False})
-    return jsonify({"status": "not_logged_in", "message": "Faça login (ou aguarde renovação)"})
+        return jsonify({"status": "ready", "message": "Sessão ativa", "token_expired_alert": _token_expired_alert})
+    return jsonify({"status": "not_logged_in", "message": "Faça login (ou aguarde renovação)", "token_expired_alert": _token_expired_alert})
 
 
 @app.route("/login/start", methods=["POST"])

@@ -1,6 +1,6 @@
 name: Motorline MConnect
 description: Proxy para API Motorline MConnect. Instala, inicia e configura no painel (login e código por email).
-version: "1.0.0"
+version: "1.0.1"
 slug: motorline_mconnect
 arch:
   - aarch64
