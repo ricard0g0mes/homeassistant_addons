@@ -3,13 +3,16 @@ from __future__ import annotations
 
 """
 Addon Home Assistant: proxy para API Motorline MConnect.
-Login automático ao arranque, painel para código por email, renovação e verificação horária do token.
+Login automático ao arranque, painel para código por email.
+Renovação do token: sem novo código quando possível (user_token → /homes/auth/token),
+leitura de API-Token-Expiry e Authorization nas respostas (HAR), e refresh proativo antes do expiry.
 """
 import json
 import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -41,7 +44,8 @@ if not DATA_DIR.exists():
 # Auth: rest.mconnect.pt (HAR). Comando do portão: api.mconnect.motorline.pt (testado pelo utilizador).
 API_BASE_URL = "https://rest.mconnect.pt"
 DEVICES_API_BASE_URL = "https://api.mconnect.motorline.pt"
-REFRESH_BEFORE_EXPIRY_SECONDS = 30000
+# Renovar token automaticamente N segundos antes de expirar (API-Token-Expiry / expires_in).
+REFRESH_BEFORE_EXPIRY_SECONDS = 300
 
 # Modo de teste: False = usar login + código por email e token da casa (recomendado).
 NO_AUTH_MODE = False
@@ -130,6 +134,56 @@ def _save_session_cookies():
             json.dump(out, f, indent=0)
     except Exception as e:
         logger.debug("save_session_cookies: %s", e)
+
+
+def _parse_api_token_expiry(header_value: str) -> float:
+    """Converte o header API-Token-Expiry (HAR) em Unix timestamp. Aceita segundos ou ISO8601."""
+    if not header_value or not isinstance(header_value, str):
+        return 0.0
+    val = header_value.strip()
+    if not val:
+        return 0.0
+    try:
+        return float(int(val))
+    except ValueError:
+        pass
+    try:
+        # ISO8601 (ex.: 2026-03-14T13:00:00Z)
+        dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        pass
+    return 0.0
+
+
+def _update_token_from_response(r: "requests.Response", token_kind: str = "home") -> None:
+    """
+    Atualiza token e expiry a partir dos headers da API (HAR: API-Token-Expiry, Authorization).
+    Permite renovação sem novo login quando o servidor envia novo token na resposta.
+    """
+    global _token, _token_expires_at
+    if not r or getattr(r, "headers", None) is None:
+        return
+    headers = r.headers
+    new_token = None
+    auth = headers.get("Authorization") or headers.get("authorization")
+    if auth and isinstance(auth, str) and auth.strip().lower().startswith("bearer "):
+        new_token = auth[7:].strip()
+    expiry = _parse_api_token_expiry(headers.get("API-Token-Expiry") or headers.get("api-token-expiry") or "")
+    if token_kind == "home" and new_token:
+        with _lock:
+            _token = new_token
+            if expiry > 0:
+                _token_expires_at = expiry
+            save_state({"token": _token, "token_expires_at": _token_expires_at})
+            logger.debug("Token da casa atualizado a partir da resposta (API-Token-Expiry=%s)", bool(expiry))
+    elif token_kind == "home" and expiry > 0 and _token:
+        with _lock:
+            _token_expires_at = expiry
+            save_state({"token_expires_at": _token_expires_at})
+            logger.debug("Expiry do token atualizado a partir da resposta: %s", expiry)
 
 
 def _open_motorline_page() -> None:
@@ -469,9 +523,11 @@ def _get_rooms(token: str) -> list[dict]:
         r = session.get(f"{base}/rooms", headers=headers, timeout=15)
         if r.cookies:
             _save_session_cookies()
-        if r.status_code == 200 and r.text:
-            raw = r.json()
-            return raw if isinstance(raw, list) else []
+        if r.status_code == 200:
+            _update_token_from_response(r, "home")
+            if r.text:
+                raw = r.json()
+                return raw if isinstance(raw, list) else []
         if r.status_code != 200:
             logger.warning("GET /rooms devolveu %s: %s", r.status_code, r.text[:200] if r.text else "")
     except Exception as e:
@@ -562,16 +618,27 @@ def ensure_token() -> tuple[str | None, str]:
     if not _user_token and opts.get("user_token") and (opts.get("user_token_expires_at") or 0) > now:
         _user_token = opts["user_token"]
         _user_token_expires_at = float(opts["user_token_expires_at"])
-    # Se já temos um token em memória, usamos sempre até a API devolver 401
+    # Se já temos um token em memória: renovar proativamente se perto do expiry (sem novo código)
     if _token:
+        if _token_expires_at and (now + REFRESH_BEFORE_EXPIRY_SECONDS) >= _token_expires_at:
+            if (_user_token and (_user_token_expires_at or 0) > now) or (
+                (opts.get("user_token") or "").strip() and (opts.get("user_token_expires_at") or 0) > now
+            ):
+                if _refresh_token_from_user_token():
+                    logger.info("Token renovado proativamente antes do expiry (sem novo código).")
         return _token, ""
     # Após reinício do addon: tentar sempre reutilizar qualquer token persistido, mesmo que o expires_at seja antigo/0.
     persisted = (opts.get("token") or "").strip()
     persisted_exp = float(opts.get("token_expires_at") or 0)
     if persisted:
         _token = persisted
-        # Mantemos o expires_at apenas como informação (não bloqueia o uso do token)
         _token_expires_at = persisted_exp or _token_expires_at or 0.0
+        if _token_expires_at and (now + REFRESH_BEFORE_EXPIRY_SECONDS) >= _token_expires_at:
+            if (_user_token and (_user_token_expires_at or 0) > now) or (
+                (opts.get("user_token") or "").strip() and (opts.get("user_token_expires_at") or 0) > now
+            ):
+                if _refresh_token_from_user_token():
+                    logger.info("Token persistido renovado proativamente antes do expiry (sem novo código).")
         return _token, ""
     # Se não temos token mas ainda existe user_token válido, tentar obter automaticamente novo token da casa
     if (_user_token and (_user_token_expires_at or 0) > now) or (
@@ -786,6 +853,7 @@ def _post_device_value(device_id: str, num: int, token: str, body: dict | None =
     if r.cookies:
         _save_session_cookies()
     if r.status_code in (200, 204):
+        _update_token_from_response(r, "home")
         logger.info("devices/value OK status=%s", r.status_code)
         return True, r.status_code, ""
     logger.warning("devices/value falhou status=%s body=%s", r.status_code, r.text[:300] if r.text else "")
@@ -824,14 +892,26 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     return False, f"HTTP {status}: {err}"
 
 
+def _format_token_expiry(expires_at: float) -> str | None:
+    """Formata token_expires_at (Unix) para exibição no painel (ex.: 14/03/2026 14:30), em hora local."""
+    if not expires_at or expires_at <= 0:
+        return None
+    try:
+        dt = datetime.fromtimestamp(expires_at)  # hora local do sistema
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return None
+
+
 @app.route("/api/ui-state", methods=["GET"])
 def api_ui_state():
-    """Estado para o painel: status, has_credentials, token_expired_alert, device_id, email, token_preview, gate_state."""
+    """Estado para o painel: status, has_credentials, token_expired_alert, device_id, email, token_preview, token_expires_at, gate_state."""
     opts = load_options()
     device_id = (opts.get("device_id") or "").strip()
     status_res = login_status().get_json()
     has_credentials = bool((opts.get("email") or "").strip() and opts.get("password"))
     token_str = (opts.get("token") or "").strip()
+    expires_at = _token_expires_at or float(opts.get("token_expires_at") or 0)
     out = {
         "status": status_res["status"],
         "message": status_res["message"],
@@ -840,6 +920,8 @@ def api_ui_state():
         "device_id": device_id or None,
         "email": (opts.get("email") or "").strip() or None,
         "token_preview": (token_str[:32] + "…") if len(token_str) > 32 else (token_str or None),
+        "token_expires_at": expires_at if expires_at > 0 else None,
+        "token_expires_at_formatted": _format_token_expiry(expires_at),
         "has_credentials": has_credentials,
     }
     if device_id:
@@ -943,7 +1025,7 @@ def _panel_html() -> str:
     <p><strong>Configuração</strong></p>
     <p><label>Device ID:</label><br><input type="text" id="configDeviceId" placeholder="ID do dispositivo" style="margin-bottom:0.25rem;"><br><button type="button" id="btnSaveDeviceId" style="background:#6c757d;">Guardar device_id</button></p>
     <p><label>Email:</label><br><span id="configEmail" style="display:inline-block;margin:0.25rem 0;"></span></p>
-    <p><label>Token (autenticação):</label><br><span id="configTokenPreview" style="display:inline-block;margin:0.25rem 0;word-break:break-all;font-size:0.85rem;"></span><br><input type="password" id="configTokenNew" placeholder="Colar novo token e guardar" style="margin-top:0.25rem;"><br><button type="button" id="btnSaveToken" style="background:#6c757d;margin-top:0.25rem;">Guardar token</button></p>
+    <p><label>Token (autenticação):</label><br><span id="configTokenPreview" style="display:inline-block;margin:0.25rem 0;word-break:break-all;font-size:0.85rem;"></span><br><span id="configTokenExpiry" style="display:inline-block;margin:0.25rem 0;font-size:0.85rem;color:#666;"></span><br><input type="password" id="configTokenNew" placeholder="Colar novo token e guardar" style="margin-top:0.25rem;"><br><button type="button" id="btnSaveToken" style="background:#6c757d;margin-top:0.25rem;">Guardar token</button></p>
   </div>
   <div id="msg"></div>
   <script>
@@ -960,6 +1042,8 @@ def _panel_html() -> str:
       el('configDeviceId').value = (d.device_id || '');
       el('configEmail').textContent = (d.email || '(não configurado)');
       el('configTokenPreview').textContent = (d.token_preview || '(nenhum)');
+      var expiry = d.token_expires_at_formatted || '';
+      el('configTokenExpiry').textContent = expiry ? ('Expira: ' + expiry) : '';
       if (!window.configCardInited) {
         window.configCardInited = true;
         el('btnSaveDeviceId').onclick = saveConfigDeviceId;
