@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Addon Home Assistant: Motorline MConnect Share.
-Acesso ao portão apenas por link de partilha (sem login, sem email/código).
-Fluxo: colar link → POST /auth/token + POST /homes/auth/token → token → /rooms, /devices/value.
+Addon Home Assistant: comandar o portão MConnect a partir do HA.
+Usa o link de partilha (app MConnect) uma vez — sem login, sem email, sem códigos.
+O addon troca home_id+access_code por token e renova quando expira; o utilizador só configura o link.
 """
 from __future__ import annotations
 
@@ -337,6 +337,18 @@ def get_devices(token: str) -> list[dict]:
     return out
 
 
+def get_first_gate_device_id(token: str) -> str | None:
+    """Obtém o device_id do primeiro dispositivo com gate_state (portão) em GET /rooms."""
+    for room in _get_rooms(token):
+        for d in room.get("devices", []):
+            if not isinstance(d, dict):
+                continue
+            for v in d.get("values", []):
+                if isinstance(v, dict) and v.get("value_id") == "gate_state":
+                    return d.get("_id") or d.get("id") or d.get("device_id") or None
+    return None
+
+
 def _post_device_value(device_id: str, num: int, token: str, body: dict | None = None) -> tuple[bool, int, str]:
     base = API_BASE_URL.rstrip("/")
     url = f"{base}/devices/value/{device_id}"
@@ -463,6 +475,11 @@ def api_ui_state():
     token_str = (opts.get("token") or "").strip()
     expires_at = _token_expires_at or float(opts.get("token_expires_at") or 0)
     token, msg = ensure_token()
+    if token and not device_id:
+        did = get_first_gate_device_id(token)
+        if did:
+            save_state({"device_id": did})
+            device_id = did
     status = "ready" if token else "not_logged_in"
     out = {
         "status": status,
@@ -500,8 +517,13 @@ def api_guest_activate():
         _token = token
         _token_expires_at = time.time() + expires_in
     save_state({"guest_home_id": home_id, "guest_access_code": access_code, "token": _token, "token_expires_at": _token_expires_at})
-    logger.info("Acesso por partilha ativado (home_id=%s).", home_id[:12])
-    return jsonify({"ok": True, "message": "Acesso ativado. Pode usar o portão.", "expires_in": expires_in})
+    device_id = get_first_gate_device_id(_token)
+    if device_id:
+        save_state({"device_id": device_id})
+        logger.info("Acesso por partilha ativado (home_id=%s, device_id=%s).", home_id[:12], device_id[:12])
+    else:
+        logger.info("Acesso por partilha ativado (home_id=%s). device_id não encontrado em /rooms.", home_id[:12])
+    return jsonify({"ok": True, "message": "Acesso ativado. Pode usar o portão.", "expires_in": expires_in, "device_id": device_id})
 
 
 @app.route("/api/device_id", methods=["POST"])
@@ -577,14 +599,13 @@ def _panel_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Motorline MConnect Share</title>
+  <title>Portão MConnect — HA</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 480px; margin: 2rem auto; padding: 0 1rem; }
     h1 { font-size: 1.25rem; margin-bottom: 1rem; }
     .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
     .success { background: #d4edda; border-color: #28a745; }
-    .alert { background: #fff3cd; border-color: #ffc107; }
     input, button { padding: 0.5rem 0.75rem; font-size: 1rem; }
     input { width: 100%; margin-bottom: 0.75rem; }
     button { background: #0d6efd; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
@@ -594,69 +615,42 @@ def _panel_html() -> str:
   </style>
 </head>
 <body>
-  <h1>Motorline MConnect Share</h1>
+  <h1>Portão MConnect no Home Assistant</h1>
   <div id="panel" class="card">A carregar...</div>
-  <div id="configCard" class="card" style="margin-top:1rem;">
-    <p><strong>Configuração</strong></p>
-    <p><label>Device ID:</label><br><input type="text" id="configDeviceId" placeholder="ID do dispositivo"><br><button type="button" id="btnSaveDeviceId" style="background:#6c757d;">Guardar device_id</button></p>
-    <p><label>Token expira:</label><br><span id="configTokenExpiry" style="font-size:0.85rem;color:#666;"></span></p>
-  </div>
   <div id="msg"></div>
   <script>
     function el(id) { return document.getElementById(id); }
     function showMsg(text, isError) { var m = el('msg'); m.textContent = text || ''; m.className = isError ? 'error' : ''; }
     function setPanel(html) { el('panel').innerHTML = html; }
     function setPanelClass(c) { el('panel').className = 'card ' + (c || ''); }
-    function setConfigCard(d) {
-      el('configDeviceId').value = d.device_id || '';
-      el('configTokenExpiry').textContent = d.token_expires_at_formatted ? ('Expira: ' + d.token_expires_at_formatted) : '';
-      if (!window.configCardInited) { window.configCardInited = true; el('btnSaveDeviceId').onclick = saveDeviceId; }
-    }
-    function saveDeviceId() {
-      var id = (el('configDeviceId').value || '').trim();
-      if (!id) { showMsg('Introduza o device_id.', true); return; }
-      showMsg('A guardar...');
-      fetch('/api/device_id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_id: id }) })
-        .then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Guardado.' : (res.error || 'Erro'), !res.ok); if (res.ok) poll(); })
-        .catch(function() { showMsg('Erro de rede.', true); });
-    }
-    function activateGuestLink() {
+    function activateLink() {
       var link = (el('guestLinkInput') && el('guestLinkInput').value || '').trim();
       if (!link) { showMsg('Cole o link de partilha.', true); return; }
-      showMsg('A ativar...');
+      showMsg('A configurar…');
       fetch('/api/guest/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ shareable_link: link }) })
-        .then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Acesso ativado.' : (res.error || 'Erro'), !res.ok); if (res.ok) poll(); })
+        .then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Configurado. Pode usar o portão.' : (res.error || 'Erro'), !res.ok); if (res.ok) poll(); })
         .catch(function() { showMsg('Erro de rede.', true); });
     }
     function poll() {
       fetch('/api/ui-state').then(r => r.json()).then(function(d) {
-        setConfigCard(d);
         if (d.status === 'ready') {
           setPanelClass('success');
-          var html = '<p><strong>Operacional</strong></p>';
-          if (d.device_id) {
-            html += '<p>Dispositivo: <code>' + (d.device_id.length > 20 ? d.device_id.slice(0,12)+'…' : d.device_id) + '</code></p>';
-            if (d.gate_state_state !== undefined) html += '<p>Estado do portão: <strong>' + (d.gate_state_state || '') + '</strong></p>';
-            html += '<p><button type="button" id="btnOpen">Abrir portão</button> <button type="button" id="btnClose" style="background:#6c757d;">Fechar portão</button></p>';
-          } else {
-            html += '<p class="alert" style="padding:0.5rem;">Introduza o ID do dispositivo abaixo (encontra na app ou no URL).</p>';
-            html += '<input type="text" id="deviceIdInput" placeholder="ID do dispositivo"><button type="button" id="btnSaveDevice">Guardar</button>';
-          }
+          var html = '<p><strong>Portão</strong></p><p>Estado: <strong>' + (d.gate_state_state || '—') + '</strong></p>';
+          html += '<p><button type="button" id="btnOpen">Abrir</button> <button type="button" id="btnClose" style="background:#6c757d;">Fechar</button></p>';
           setPanel(html);
           if (el('btnOpen')) el('btnOpen').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":2}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Abrir enviado.' : (res.error || 'Erro'), !res.ok); poll(); }); };
           if (el('btnClose')) el('btnClose').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":0}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Fechar enviado.' : (res.error || 'Erro'), !res.ok); poll(); }); };
-          if (el('btnSaveDevice')) el('btnSaveDevice').onclick = function() { var id = (el('deviceIdInput') && el('deviceIdInput').value || '').trim(); if (!id) { showMsg('Introduza o ID.', true); return; } fetch('/api/device_id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ device_id: id }) }).then(r => r.json()).then(function(res) { if (res.ok) poll(); }); };
           return;
         }
         setPanelClass('');
         var savedLink = (el('guestLinkInput') && el('guestLinkInput').value) || '';
         var msg = !d.guest_activated
-          ? '<p><strong>Acesso por partilha</strong></p><p>Cole o link que recebeu e clique em Ativar. Acesso imediato ao portão, sem login.</p>'
-          : '<p><strong>Acesso por partilha</strong></p><p>Se o acesso falhou ou expirou, cole um novo link e ative novamente.</p>';
-        setPanel(msg + '<input type="text" id="guestLinkInput" placeholder="https://mconnect.pt/shareable_link?home_id=...&access_code=..." style="width:100%;margin:0.5rem 0;"><button type="button" id="btnGuestActivate">Ativar link</button>');
+          ? '<p><strong>Configuração única</strong></p><p>Na app MConnect (telemóvel): Partilhar acesso → criar link de partilha. Cole esse link aqui e clique em Configurar. Depois o portão fica disponível no HA (este painel, MQTT, API) sem login nem códigos por email.</p>'
+          : '<p>Link expirado ou inválido. Crie um novo link de partilha na app e cole aqui.</p>';
+        setPanel(msg + '<input type="text" id="guestLinkInput" placeholder="https://mconnect.pt/shareable_link?home_id=...&access_code=..." style="width:100%;margin:0.5rem 0;"><button type="button" id="btnGuestActivate">Configurar</button>');
         if (el('guestLinkInput') && savedLink) el('guestLinkInput').value = savedLink;
-        el('btnGuestActivate').onclick = activateGuestLink;
-        if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateGuestLink(); };
+        el('btnGuestActivate').onclick = activateLink;
+        if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateLink(); };
       }).catch(function() { setPanel('<p>Erro a obter estado.</p>'); });
     }
     poll();

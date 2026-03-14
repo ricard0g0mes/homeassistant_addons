@@ -1,6 +1,6 @@
 name: Motorline MConnect Share
-description: Acesso ao portão MConnect por link de partilha. Sem login — cola o link e fica com comando completo.
-version: "1.0.0"
+description: Comandar o portão MConnect a partir do HA. Use o link de partilha (app MConnect) uma vez — sem login, sem email, sem códigos. O addon trata de tudo.
+version: "1.0.1"
 slug: motorline_mconnect_share_addon
 arch:
   - aarch64
