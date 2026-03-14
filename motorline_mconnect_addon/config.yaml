@@ -15,7 +15,7 @@ ports_description:
   8766/tcp: Painel e API para portão (acesso por partilha)
 options:
   mqtt_enabled: false
-  mqtt_host: core-mosquitto
+  mqtt_host: 127.0.0.1
   mqtt_port: 1883
   mqtt_user: ""
   mqtt_password: ""

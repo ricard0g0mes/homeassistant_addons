@@ -419,7 +419,7 @@ def _mqtt_thread():
     addon = load_addon_options()
     if not addon.get("mqtt_enabled"):
         return
-    host = str(addon.get("mqtt_host", "core-mosquitto")).strip()
+    host = str(addon.get("mqtt_host", "127.0.0.1")).strip()
     port = int(addon.get("mqtt_port", 1883))
     user = (addon.get("mqtt_user") or "").strip()
     password = (addon.get("mqtt_password") or "").strip()
@@ -644,14 +644,19 @@ def _panel_html() -> str:
           return;
         }
         setPanelClass('');
-        var savedLink = (el('guestLinkInput') && el('guestLinkInput').value) || '';
         var msg = !d.guest_activated
           ? '<p><strong>Configuração única</strong></p><p>Na app MConnect (telemóvel): Partilhar acesso → criar link de partilha. Cole esse link aqui e clique em Configurar. Depois o portão fica disponível no HA (este painel, MQTT, API) sem login nem códigos por email.</p>'
           : '<p>Link expirado ou inválido. Crie um novo link de partilha na app e cole aqui.</p>';
-        setPanel(msg + '<input type="text" id="guestLinkInput" placeholder="https://mconnect.pt/shareable_link?home_id=...&access_code=..." style="width:100%;margin:0.5rem 0;"><button type="button" id="btnGuestActivate">Configurar</button>');
-        if (el('guestLinkInput') && savedLink) el('guestLinkInput').value = savedLink;
-        el('btnGuestActivate').onclick = activateLink;
-        if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateLink(); };
+        var existingInput = el('guestLinkInput');
+        if (existingInput) {
+          el('guestMsg').innerHTML = msg;
+          el('btnGuestActivate').onclick = activateLink;
+          if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateLink(); };
+        } else {
+          setPanel('<div id="guestMsg">' + msg + '</div><input type="text" id="guestLinkInput" placeholder="https://mconnect.pt/shareable_link?home_id=...&access_code=..." style="width:100%;margin:0.5rem 0;"><button type="button" id="btnGuestActivate">Configurar</button>');
+          el('btnGuestActivate').onclick = activateLink;
+          if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateLink(); };
+        }
       }).catch(function() { setPanel('<p>Erro a obter estado.</p>'); });
     }
     poll();
