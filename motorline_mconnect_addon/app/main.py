@@ -250,14 +250,11 @@ def ensure_token() -> tuple[str | None, str]:
     global _token, _token_expires_at
     opts = load_options()
     now = time.time()
-    if not _token and opts.get("guest_home_id") and opts.get("guest_access_code"):
-        token, exp = guest_exchange_link_for_token(opts["guest_home_id"], opts["guest_access_code"])
-        if token:
-            with _lock:
-                _token = token
-                _token_expires_at = now + exp
-                save_state({"token": _token, "token_expires_at": _token_expires_at})
-            return _token, ""
+    persisted = (opts.get("token") or "").strip()
+    persisted_exp = float(opts.get("token_expires_at") or 0)
+    if not _token and persisted:
+        _token = persisted
+        _token_expires_at = persisted_exp or 0.0
     if _token:
         if _token_expires_at and (now + REFRESH_BEFORE_EXPIRY_SECONDS) >= _token_expires_at and opts.get("guest_home_id") and opts.get("guest_access_code"):
             token, exp = guest_exchange_link_for_token(opts["guest_home_id"], opts["guest_access_code"])
@@ -268,20 +265,15 @@ def ensure_token() -> tuple[str | None, str]:
                     save_state({"token": _token, "token_expires_at": _token_expires_at})
                 logger.info("Token de partilha renovado proativamente.")
         return _token, ""
-    persisted = (opts.get("token") or "").strip()
-    persisted_exp = float(opts.get("token_expires_at") or 0)
-    if persisted:
-        _token = persisted
-        _token_expires_at = persisted_exp or 0.0
-        if _token_expires_at and (now + REFRESH_BEFORE_EXPIRY_SECONDS) >= _token_expires_at and opts.get("guest_home_id") and opts.get("guest_access_code"):
-            token, exp = guest_exchange_link_for_token(opts["guest_home_id"], opts["guest_access_code"])
-            if token:
-                with _lock:
-                    _token = token
-                    _token_expires_at = time.time() + exp
-                    save_state({"token": _token, "token_expires_at": _token_expires_at})
-        return _token, ""
-    return None, "Cole o link de partilha no painel e clique em Ativar."
+    if opts.get("guest_home_id") and opts.get("guest_access_code"):
+        token, exp = guest_exchange_link_for_token(opts["guest_home_id"], opts["guest_access_code"])
+        if token:
+            with _lock:
+                _token = token
+                _token_expires_at = now + exp
+                save_state({"token": _token, "token_expires_at": _token_expires_at})
+            return _token, ""
+    return None, "Cole o link de partilha no painel e clique em Ativar ou verifique o link."
 
 
 def _get_rooms(token: str) -> list[dict]:
@@ -396,7 +388,7 @@ def _format_token_expiry(expires_at: float) -> str | None:
 MQTT_TOPIC_STATE = "motorline/share/portao/state"
 MQTT_TOPIC_COMMAND = "motorline/share/portao/command"
 MQTT_DISCOVERY_PREFIX = "homeassistant"
-MQTT_STATE_UPDATE_INTERVAL = 5  # segundos entre cada publicação do estado (sensor)
+MQTT_STATE_UPDATE_INTERVAL = 1800  # segundos entre cada publicação periódica do estado (sensor)
 
 
 def _mqtt_publish_state(client):
@@ -624,6 +616,13 @@ def _panel_html() -> str:
     function showMsg(text, isError) { var m = el('msg'); m.textContent = text || ''; m.className = isError ? 'error' : ''; }
     function setPanel(html) { el('panel').innerHTML = html; }
     function setPanelClass(c) { el('panel').className = 'card ' + (c || ''); }
+    var activePollId = null;
+    var passivePollId = null;
+    function startActivePoll() {
+      if (activePollId) return;
+      if (passivePollId) { clearInterval(passivePollId); passivePollId = null; }
+      activePollId = setInterval(poll, 5000);
+    }
     function activateLink() {
       var link = (el('guestLinkInput') && el('guestLinkInput').value || '').trim();
       if (!link) { showMsg('Cole o link de partilha.', true); return; }
@@ -639,8 +638,12 @@ def _panel_html() -> str:
           var html = '<p><strong>Portão</strong></p><p>Estado: <strong>' + (d.gate_state_state || '—') + '</strong></p>';
           html += '<p><button type="button" id="btnOpen">Abrir</button> <button type="button" id="btnClose" style="background:#6c757d;">Fechar</button></p>';
           setPanel(html);
-          if (el('btnOpen')) el('btnOpen').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":2}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Abrir enviado.' : (res.error || 'Erro'), !res.ok); poll(); }); };
-          if (el('btnClose')) el('btnClose').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":0}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Fechar enviado.' : (res.error || 'Erro'), !res.ok); poll(); }); };
+          if (el('btnOpen')) el('btnOpen').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":2}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Abrir enviado.' : (res.error || 'Erro'), !res.ok); if (res.ok) startActivePoll(); poll(); }); };
+          if (el('btnClose')) el('btnClose').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":0}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Fechar enviado.' : (res.error || 'Erro'), !res.ok); if (res.ok) startActivePoll(); poll(); }); };
+          if (d.gate_state_state === 'fechado') {
+            if (activePollId) { clearInterval(activePollId); activePollId = null; }
+            if (!passivePollId) passivePollId = setInterval(poll, 1800000);
+          }
           return;
         }
         setPanelClass('');
@@ -660,7 +663,7 @@ def _panel_html() -> str:
       }).catch(function() { setPanel('<p>Erro a obter estado.</p>'); });
     }
     poll();
-    setInterval(poll, 4000);
+    passivePollId = setInterval(poll, 1800000);
   </script>
 </body>
 </html>"""
