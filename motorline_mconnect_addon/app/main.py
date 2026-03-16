@@ -47,6 +47,10 @@ _token_expires_at = 0.0
 _lock = threading.Lock()
 _session: requests.Session | None = None
 _session_lock = threading.Lock()
+_last_guest_exchange_error_at = 0.0
+_last_guest_exchange_max_devices_at = 0.0
+GUEST_EXCHANGE_COOLDOWN_SECONDS = 300
+GUEST_MAX_DEVICES_COOLDOWN_SECONDS = 3600
 
 app = Flask(__name__)
 
@@ -202,6 +206,7 @@ def parse_shareable_link(link: str) -> tuple[str | None, str | None]:
 
 
 def guest_exchange_link_for_token(home_id: str, access_code: str) -> tuple[str | None, int]:
+    global _last_guest_exchange_error_at, _last_guest_exchange_max_devices_at
     base = API_BASE_URL.rstrip("/")
     headers = {"Content-Type": "application/json", "Origin": "https://mconnect.pt", "timezone": "Europe/Lisbon"}
     session = get_http_session()
@@ -215,7 +220,12 @@ def guest_exchange_link_for_token(home_id: str, access_code: str) -> tuple[str |
         if r1.cookies:
             _save_session_cookies()
         if r1.status_code != 200 or not r1.text:
-            logger.warning("Guest POST /auth/token: status=%s %s", r1.status_code, (r1.text or "")[:200])
+            body = (r1.text or "")[:200]
+            logger.warning("Guest POST /auth/token: status=%s %s", r1.status_code, body)
+            now = time.time()
+            _last_guest_exchange_error_at = now
+            if r1.status_code == 403 and "MaxTrustedDevicesError" in body:
+                _last_guest_exchange_max_devices_at = now
             return None, 0
         data1 = r1.json()
         first_token = data1.get("access_token") or data1.get("token") or data1.get("accessToken")
@@ -232,6 +242,7 @@ def guest_exchange_link_for_token(home_id: str, access_code: str) -> tuple[str |
             _save_session_cookies()
         if r2.status_code != 200 or not r2.text:
             logger.warning("Guest POST /homes/auth/token: status=%s %s", r2.status_code, (r2.text or "")[:200])
+            _last_guest_exchange_error_at = time.time()
             return None, 0
         data2 = r2.json()
         token = data2.get("access_token") or data2.get("token") or data2.get("accessToken")
@@ -247,7 +258,7 @@ def guest_exchange_link_for_token(home_id: str, access_code: str) -> tuple[str |
 
 
 def ensure_token() -> tuple[str | None, str]:
-    global _token, _token_expires_at
+    global _token, _token_expires_at, _last_guest_exchange_error_at, _last_guest_exchange_max_devices_at
     opts = load_options()
     now = time.time()
     persisted = (opts.get("token") or "").strip()
@@ -257,6 +268,10 @@ def ensure_token() -> tuple[str | None, str]:
         _token_expires_at = persisted_exp or 0.0
     if _token:
         if _token_expires_at and (now + REFRESH_BEFORE_EXPIRY_SECONDS) >= _token_expires_at and opts.get("guest_home_id") and opts.get("guest_access_code"):
+            if _last_guest_exchange_max_devices_at and (now - _last_guest_exchange_max_devices_at) < GUEST_MAX_DEVICES_COOLDOWN_SECONDS:
+                return _token, "O serviço recusou novas sessões (MaxTrustedDevicesError). Termine sessões noutros dispositivos ou gere novo link."
+            if _last_guest_exchange_error_at and (now - _last_guest_exchange_error_at) < GUEST_EXCHANGE_COOLDOWN_SECONDS:
+                return _token, "A renovar token em backoff devido a erros recentes."
             token, exp = guest_exchange_link_for_token(opts["guest_home_id"], opts["guest_access_code"])
             if token:
                 with _lock:
@@ -266,6 +281,10 @@ def ensure_token() -> tuple[str | None, str]:
                 logger.info("Token de partilha renovado proativamente.")
         return _token, ""
     if opts.get("guest_home_id") and opts.get("guest_access_code"):
+        if _last_guest_exchange_max_devices_at and (now - _last_guest_exchange_max_devices_at) < GUEST_MAX_DEVICES_COOLDOWN_SECONDS:
+            return None, "Foi atingido o número máximo de sessões neste serviço. Termine a sessão noutros dispositivos/app MConnect ou gere um novo link de partilha."
+        if _last_guest_exchange_error_at and (now - _last_guest_exchange_error_at) < GUEST_EXCHANGE_COOLDOWN_SECONDS:
+            return None, "A aguardar antes de tentar renovar o token novamente devido a erros recentes."
         token, exp = guest_exchange_link_for_token(opts["guest_home_id"], opts["guest_access_code"])
         if token:
             with _lock:
@@ -273,7 +292,7 @@ def ensure_token() -> tuple[str | None, str]:
                 _token_expires_at = now + exp
                 save_state({"token": _token, "token_expires_at": _token_expires_at})
             return _token, ""
-    return None, "Cole o link de partilha no painel e clique em Ativar ou verifique o link."
+    return None, "Cole o link de partilha no painel, clique em Ativar ou verifique o link / sessões ativas na app."
 
 
 def _get_rooms(token: str) -> list[dict]:
@@ -365,13 +384,13 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
     if ok:
         return True, ""
     if status == 401:
-        opts = load_options()
-        if opts.get("guest_home_id") and opts.get("guest_access_code") and guest_exchange_link_for_token(opts["guest_home_id"], opts["guest_access_code"])[0]:
-            new_token, _ = ensure_token()
-            if new_token:
-                ok2, _, _ = _post_device_value(device_id, num, new_token)
-                if ok2:
-                    return True, ""
+        new_token, msg = ensure_token()
+        if new_token and new_token != token:
+            ok2, _, _ = _post_device_value(device_id, num, new_token)
+            if ok2:
+                return True, ""
+        if msg:
+            error_msg = msg
     return False, (f"HTTP {status}: {err}" if status else (error_msg or ""))
 
 
@@ -623,6 +642,12 @@ def _panel_html() -> str:
       if (passivePollId) { clearInterval(passivePollId); passivePollId = null; }
       activePollId = setInterval(poll, 5000);
     }
+    function renderGuestConfig(msg) {
+      msg = msg || '<p><strong>Configuração única</strong></p><p>Na app MConnect (telemóvel): Partilhar acesso → criar link de partilha. Cole esse link aqui e clique em Configurar. Depois o portão fica disponível no HA (este painel, MQTT, API) sem login nem códigos por email.</p>';
+      setPanel('<div id="guestMsg">' + msg + '</div><input type="text" id="guestLinkInput" placeholder="https://mconnect.pt/shareable_link?home_id=...&access_code=..." style="width:100%;margin:0.5rem 0;"><button type="button" id="btnGuestActivate">Configurar</button>');
+      el('btnGuestActivate').onclick = activateLink;
+      if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateLink(); };
+    }
     function activateLink() {
       var link = (el('guestLinkInput') && el('guestLinkInput').value || '').trim();
       if (!link) { showMsg('Cole o link de partilha.', true); return; }
@@ -637,9 +662,11 @@ def _panel_html() -> str:
           setPanelClass('success');
           var html = '<p><strong>Portão</strong></p><p>Estado: <strong>' + (d.gate_state_state || '—') + '</strong></p>';
           html += '<p><button type="button" id="btnOpen">Abrir</button> <button type="button" id="btnClose" style="background:#6c757d;">Fechar</button></p>';
+          html += '<p style="margin-top:0.75rem;"><button type="button" id="btnChangeLink" style="background:#6c757d;">Alterar link de partilha</button></p>';
           setPanel(html);
           if (el('btnOpen')) el('btnOpen').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":2}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Abrir enviado.' : (res.error || 'Erro'), !res.ok); if (res.ok) startActivePoll(); poll(); }); };
           if (el('btnClose')) el('btnClose').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":0}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Fechar enviado.' : (res.error || 'Erro'), !res.ok); if (res.ok) startActivePoll(); poll(); }); };
+          if (el('btnChangeLink')) el('btnChangeLink').onclick = function() { renderGuestConfig(); };
           if (d.gate_state_state === 'fechado') {
             if (activePollId) { clearInterval(activePollId); activePollId = null; }
             if (!passivePollId) passivePollId = setInterval(poll, 1800000);
@@ -656,9 +683,7 @@ def _panel_html() -> str:
           el('btnGuestActivate').onclick = activateLink;
           if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateLink(); };
         } else {
-          setPanel('<div id="guestMsg">' + msg + '</div><input type="text" id="guestLinkInput" placeholder="https://mconnect.pt/shareable_link?home_id=...&access_code=..." style="width:100%;margin:0.5rem 0;"><button type="button" id="btnGuestActivate">Configurar</button>');
-          el('btnGuestActivate').onclick = activateLink;
-          if (el('guestLinkInput')) el('guestLinkInput').onkeydown = function(e) { if (e.key === 'Enter') activateLink(); };
+          renderGuestConfig(msg);
         }
       }).catch(function() { setPanel('<p>Erro a obter estado.</p>'); });
     }
