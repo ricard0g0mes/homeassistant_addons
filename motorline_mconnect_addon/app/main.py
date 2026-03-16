@@ -382,6 +382,11 @@ def set_device_value(device_id: str, value: str | int | float) -> tuple[bool, st
         return False, error_msg or "Falha ao obter token"
     ok, status, err = _post_device_value(device_id, num, token)
     if ok:
+        # Regista momento do último comando para permitir polling MQTT mais frequente logo após a ordem
+        try:
+            save_state({"last_command_at": time.time()})
+        except Exception:
+            pass
         return True, ""
     if status == 401:
         new_token, msg = ensure_token()
@@ -407,7 +412,8 @@ def _format_token_expiry(expires_at: float) -> str | None:
 MQTT_TOPIC_STATE = "motorline/share/portao/state"
 MQTT_TOPIC_COMMAND = "motorline/share/portao/command"
 MQTT_DISCOVERY_PREFIX = "homeassistant"
-MQTT_STATE_UPDATE_INTERVAL = 1800  # segundos entre cada publicação periódica do estado (sensor)
+MQTT_STATE_IDLE_INTERVAL = 1800   # intervalo quando está tudo parado
+MQTT_STATE_ACTIVE_INTERVAL = 5    # intervalo após comando recente (até estabilizar)
 
 
 def _mqtt_publish_state(client):
@@ -470,9 +476,24 @@ def _mqtt_thread():
         logger.warning("MQTT connect falhou: %s", e)
         return
     client.loop_start()
-    time.sleep(2)
+    # Primeira publicação de estado após ligar
+    try:
+        time.sleep(2)
+        _mqtt_publish_state(client)
+    except Exception as e:
+        logger.debug("MQTT publish inicial: %s", e)
+    # Loop com intervalo dinâmico: rápido após comando recente, lento em repouso
     while True:
-        time.sleep(MQTT_STATE_UPDATE_INTERVAL)
+        try:
+            state = load_state()
+            last_cmd = float(state.get("last_command_at") or 0)
+        except Exception:
+            last_cmd = 0.0
+        now = time.time()
+        interval = MQTT_STATE_IDLE_INTERVAL
+        if last_cmd and (now - last_cmd) < 60:
+            interval = MQTT_STATE_ACTIVE_INTERVAL
+        time.sleep(interval)
         try:
             _mqtt_publish_state(client)
         except Exception as e:
@@ -523,6 +544,14 @@ def api_guest_activate():
         return jsonify({"ok": False, "error": "Envie shareable_link (URL) ou home_id e access_code."}), 400
     token, expires_in = guest_exchange_link_for_token(home_id, access_code)
     if not token:
+        # Distinguir caso de limite de dispositivos vs link realmente inválido
+        now = time.time()
+        global _last_guest_exchange_max_devices_at
+        if _last_guest_exchange_max_devices_at and (now - _last_guest_exchange_max_devices_at) < GUEST_MAX_DEVICES_COOLDOWN_SECONDS:
+            return jsonify({
+                "ok": False,
+                "error": "O link é válido, mas o serviço recusou novas sessões (MaxTrustedDevicesError). Termine sessões noutros dispositivos/app MConnect ou remova partilhas antigas e tente de novo.",
+            }), 400
         return jsonify({"ok": False, "error": "Link inválido ou expirado. Gere um novo link de partilha na app."}), 400
     global _token, _token_expires_at
     with _lock:
@@ -653,7 +682,14 @@ def _panel_html() -> str:
       if (!link) { showMsg('Cole o link de partilha.', true); return; }
       showMsg('A configurar…');
       fetch('/api/guest/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ shareable_link: link }) })
-        .then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Configurado. Pode usar o portão.' : (res.error || 'Erro'), !res.ok); if (res.ok) poll(); })
+        .then(r => r.json()).then(function(res) {
+          showMsg(res.ok ? 'Configurado. A obter estado do portão…' : (res.error || 'Erro'), !res.ok);
+          if (res.ok) {
+            // Após registar o link, faz polling rápido até obter um estado real
+            startActivePoll();
+            poll();
+          }
+        })
         .catch(function() { showMsg('Erro de rede.', true); });
     }
     function poll() {
@@ -667,7 +703,11 @@ def _panel_html() -> str:
           if (el('btnOpen')) el('btnOpen').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":2}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Abrir enviado.' : (res.error || 'Erro'), !res.ok); if (res.ok) startActivePoll(); poll(); }); };
           if (el('btnClose')) el('btnClose').onclick = function() { fetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"value":0}' }).then(r => r.json()).then(function(res) { showMsg(res.ok ? 'Fechar enviado.' : (res.error || 'Erro'), !res.ok); if (res.ok) startActivePoll(); poll(); }); };
           if (el('btnChangeLink')) el('btnChangeLink').onclick = function() { renderGuestConfig(); };
-          if (d.gate_state_state === 'fechado') {
+          // Se ainda está "desconhecido" logo após ativar o link, manter polling rápido
+          if (d.gate_state_state === 'desconhecido') {
+            if (!activePollId) startActivePoll();
+          } else if (d.gate_state_state === 'fechado') {
+            // Quando o portão volta a ficar fechado, volta ao polling espaçado
             if (activePollId) { clearInterval(activePollId); activePollId = null; }
             if (!passivePollId) passivePollId = setInterval(poll, 1800000);
           }
